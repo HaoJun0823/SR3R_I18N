@@ -177,6 +177,9 @@ static volatile LONG g_dictReady = 0;
 static uint8_t  g_charSet[8192];
 static uint32_t g_charCount = 0;
 
+// 字符使用频率（词典全文出现次数, RasterizeThread 按频率降序光栅化: 高频字优先入图集）
+static uint16_t g_charFreq[65536];
+
 static void CharSetAdd(wchar_t c)
 {
     if (c < 0x80) return;
@@ -187,6 +190,7 @@ static void CharSetAdd(wchar_t c)
         g_charSet[i >> 3] |= (uint8_t)(1u << (i & 7));
         ++g_charCount;
     }
+    if (g_charFreq[i] < 0xFFFFu) ++g_charFreq[i];   // 频率饱和计数
 }
 
 static bool DictInsert(const wchar_t* key, uint32_t keyLen, const wchar_t* trans)
@@ -340,6 +344,7 @@ struct FakeFont
     int32_t*  advances;         // nCells
     uint32_t* cps;              // nCells
     uint32_t  nCells;
+    uint32_t  blankY;           // 预留空白 cell 的图集 Y（缺字槽位指到这里, 超容量字符空白渲染）
     uint16_t  cellW, cellH;
     // 伪纹理对象（sub_14085D930 读 +8/+10 宽高; +20 变体数; +34 速度）
     uint8_t   fakeTexObj[64];
@@ -469,7 +474,7 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     f->cellW = cellW; f->cellH = cellH;
     f->official = off;
 
-    // 收集字符集 -> 列表
+    // 收集字符集 -> 列表（按词典使用频率降序: 高频字优先入图集, 低频字容量不足时被截断）
     uint32_t total = g_charCount;
     f->cps      = static_cast<uint32_t*>(malloc(sizeof(uint32_t) * (total ? total : 1)));
     f->advances = static_cast<int32_t*>(malloc(sizeof(int32_t) * (total ? total : 1)));
@@ -481,6 +486,26 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     }
     memset(f->cellBuf, 0, (size_t)cellW * cellH * total);
 
+    uint32_t n = 0;
+    for (uint32_t cp = 0x80; cp <= 0xFFFD && n < total; ++cp)
+    {
+        if (!(g_charSet[cp >> 3] & (1u << (cp & 7)))) continue;
+        f->cps[n++] = cp;
+    }
+    // 插入排序按频率降序（数组初始升序, 近乎有序时接近 O(n)）
+    for (uint32_t i = 1; i < n; ++i)
+    {
+        uint32_t kc = f->cps[i];
+        uint32_t kf = g_charFreq[kc];
+        uint32_t j = i;
+        while (j > 0 && g_charFreq[f->cps[j - 1]] < kf)
+        {
+            f->cps[j] = f->cps[j - 1];
+            --j;
+        }
+        f->cps[j] = kc;
+    }
+
     // 光栅化
     float scale = stbtt_ScaleForPixelHeight(&g_stb, (float)cellH);
     int ascent, descent, gap;
@@ -489,21 +514,17 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     if (baseline > cellH - 1) baseline = cellH - 1;
     if (baseline < 1) baseline = 1;
 
-    uint32_t n = 0, missGlyph = 0;
-    for (uint32_t cp = 0x80; cp <= 0xFFFD; ++cp)
+    uint32_t missGlyph = 0;
+    for (uint32_t idx = 0; idx < n; ++idx)
     {
-        if (!(g_charSet[cp >> 3] & (1u << (cp & 7)))) continue;
-        if (n >= total) break;
+        uint32_t cp = f->cps[idx];
+        uint8_t* cell = f->cellBuf + (size_t)idx * cellW * cellH;
 
         int g = stbtt_FindGlyphIndex(&g_stb, (int)cp);
-        uint8_t* cell = f->cellBuf + (size_t)n * cellW * cellH;
-        f->cps[n] = cp;
-
         if (g == 0)
         {
             ++missGlyph;
-            f->advances[n] = cellW;   // 无字形: 空白格
-            ++n;
+            f->advances[idx] = cellW;   // 无字形: 空白格
             continue;
         }
 
@@ -515,8 +536,8 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
 
         int adv;
         stbtt_GetGlyphHMetrics(&g_stb, g, &adv, nullptr);
-        f->advances[n] = adv > 0 ? (int)((float)adv * scale + 0.5f) : cellW;
-        if (f->advances[n] <= 0) f->advances[n] = cellW / 2;
+        f->advances[idx] = adv > 0 ? (int)((float)adv * scale + 0.5f) : cellW;
+        if (f->advances[idx] <= 0) f->advances[idx] = cellW / 2;
 
         if (w > 0 && h > 0)
         {
@@ -539,7 +560,6 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
                 free(tmp);
             }
         }
-        ++n;
     }
     f->nCells = n;
 
@@ -819,15 +839,19 @@ static bool FinishFont(FakeFont* f)
     uint32_t offH = dd.Height;
     uint32_t perRow = W / f->cellW;
     if (perRow == 0) { Log("font%u: atlas width %u < cellW %u, abort", fontId, W, f->cellW); srcTex->Release(); f->state = 4; return false; }
+    uint32_t nCellsWanted = f->nCells;   // 截断前记录（日志用）
     uint32_t rows = (f->nCells + perRow - 1) / perRow;
-    uint32_t H = offH + rows * f->cellH;
-    if (H > 16384)   // D3D11 纹理最大维度
+    uint32_t maxRows = (16384 - offH) / f->cellH - 1;   // 末尾恒留 1 行空白 cell（缺字槽位指向这里）
+    if (rows > maxRows)
     {
-        rows = (16384 - offH) / f->cellH;
-        H = offH + rows * f->cellH;
-        f->nCells = f->nCells < rows * perRow ? f->nCells : rows * perRow;
-        Log("font%u: atlas height clamped to %u (%u cells)", fontId, H, f->nCells);
+        rows = maxRows;
+        f->nCells = rows * perRow;   // 截断低频字（数组已按频率降序, 尾部被截）
+        Log("font%u: atlas cells clamped %u -> %u (low-freq chars blank)",
+            fontId, nCellsWanted, f->nCells);
     }
+    uint32_t H = offH + (rows + 1) * f->cellH;
+    f->blankY = offH + rows * f->cellH;   // 空白行: 图集该区已 memset 0
+    if (H > 16384) { Log("font%u: H=%u overflow, abort", fontId, H); srcTex->Release(); f->state = 4; return false; }
 
     // 拼接 buffer
     uint32_t pitch = W * 4;
@@ -1000,7 +1024,7 @@ static bool FinishFont(FakeFont* f)
     memcpy(xt,  offXtab, (size_t)offCount * 4);
     memcpy(yt,  offYtab, (size_t)offCount * 4);
 
-    // 中文字符区
+    // 中文字符区（容量截断后的字符）; 超容量槽位 = 预留空白 cell（透明, 不遮挡）
     for (uint32_t i = 0; i < f->nCells; ++i)
     {
         uint32_t cp = f->cps[i];
@@ -1011,6 +1035,13 @@ static bool FinishFont(FakeFont* f)
         *(int16_t*)(met + (size_t)slot * 16 + 12) = -1;                  // 无 kern
         *(uint32_t*)(xt + (size_t)slot * 4) = (i % perRow) * f->cellW;
         *(uint32_t*)(yt + (size_t)slot * 4) = offH + (i / perRow) * f->cellH;
+    }
+    for (uint32_t slot = (uint32_t)offCount; slot < FAKE_GLYPHS; ++slot)   // 漏填的槽位（含超容量字符）
+    {
+        // yt 已随 memset 为 0; 指向预留空白行, 避免渲染到图集顶部
+        *(int32_t*)(met + (size_t)slot * 16 + 0)  = f->cellW;
+        *(int32_t*)(met + (size_t)slot * 16 + 4)  = f->cellW;
+        *(uint32_t*)(yt + (size_t)slot * 4) = f->blankY;
     }
 
     f->obj = obj;
@@ -1026,7 +1057,7 @@ static bool FinishFont(FakeFont* f)
     free(f->advances); f->advances = nullptr;
     free(f->cps); f->cps = nullptr;
 
-    Log("font%u: LIVE atlas=%ux%u cells=%u blob=%zuKB", fontId, W, H, f->nCells, blobSize >> 10);
+    Log("font%u: LIVE atlas=%ux%u cells=%u kept=%u blob=%zuKB", fontId, W, H, nCellsWanted, f->nCells, blobSize >> 10);
     InterlockedExchange(&f->state, 2);
     return true;
 }
@@ -1416,6 +1447,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         LogOpen(hModule);
         if (g_log)
         {
+			Log("[Info] SR3R Character Extend By Randerion(HaoJun0823) https://www.haojun0823.xyz | https://github.com/HaoJun0823/SR3R_I18N");
             Log("[DllMain] ATTACH v6");
             CloseHandle(CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr));
         }
