@@ -1,8 +1,0 @@
-0000000000000000000000000000000000000000 077c7f1dc1c7d5793b75dd66e8162c634666703f haojun0823 <email@haojun0823.xyz> 1788539273 +0800	commit (initial): SR3R_I18N probe: UAL scripts/*.asi probe DLL, font wait + registry dump (/MT /utf-8)
-077c7f1dc1c7d5793b75dd66e8162c634666703f 21da9ea945bec903454941b1419c269e8ddf2bfc haojun0823 <email@haojun0823.xyz> 1788539758 +0800	commit: add .gitignore, untrack build artifacts
-21da9ea945bec903454941b1419c269e8ddf2bfc 76032ec63d18968517073b7e1f3d4f9f2917c07a haojun0823 <email@haojun0823.xyz> 1788540205 +0800	commit: probe v2: log to scripts dir w/ CS lock+PID/TID, hexdump fontTab[0], dump qword_142998178 (fontId=-1) + logical font table
-76032ec63d18968517073b7e1f3d4f9f2917c07a 532f9653eef7477c3bd691b423d2411d7ea1db03 haojun0823 <email@haojun0823.xyz> 1788540710 +0800	commit: v3: hook font_body - copy 336 glyphs + append 20 (A..U metrics), atomic count flip
-532f9653eef7477c3bd691b423d2411d7ea1db03 2ee45bef22c5349df074fd6080f750857869c094 haojun0823 <email@haojun0823.xyz> 1788541362 +0800	commit: v3.1: fix VFNT magic byte order (little-endian u32 0x56464E54)
-2ee45bef22c5349df074fd6080f750857869c094 8133b74a06c5ba95e4df62da2cffdb6f75f75422 haojun0823 <email@haojun0823.xyz> 1788542641 +0800	commit: v3.2: fix append-loop pointer arithmetic (16B/entry byte addressing) + explicit kernIdx=-1
-8133b74a06c5ba95e4df62da2cffdb6f75f75422 4536c0bcbe25204b0f69d83784d3ce45f991fe51 haojun0823 <email@haojun0823.xyz> 1788543364 +0800	commit: v4: dual-font table hook (font_body + font_header_pc), deploy as scripts\SR3R_I18N.asi
-4536c0bcbe25204b0f69d83784d3ce45f991fe51 e525faf105c007384ca8de5ed09497210f6a4b8a haojun0823 <email@haojun0823.xyz> 1788549852 +0800	commit: v5: 3DM 式运行时文本替换（BEXT 词典 + DrawWide/Format 双 detour + DumpText）

@@ -369,29 +369,20 @@ static SrvResolve_t g_origSrvResolve = nullptr;
 // ---------- Hook C: 字体对象查询 ----------
 static void* __fastcall HookFontLookup(int fontId)
 {
-    if (fontId >= 0 && (uint32_t)fontId < FAKE_FONT_MAX)
-    {
-        FakeFont* f = &g_fake[fontId];
-        if (f->state == 2)
-        {
-            // 校验官方对象仍在槽位（引擎重建字体则回退官方, 防悬空）
-            void* cur = (*g_fontTabPtr)[fontId];
-            if (cur == f->official) return f->obj;
-            f->state = 4;  // 官方被换, 放弃伪对象
-            return cur;
-        }
-    }
     void* off = g_origFontLookup(fontId);
-    if (off && fontId < 0)
+    if (off)
     {
-        // 自定义字体组(负id)映射到官方对象: 反查 live 伪对象
-        for (uint32_t i = 0; i < FAKE_FONT_MAX; ++i)
+        uint32_t slot = (fontId >= 0) ? (uint32_t)fontId : ResolveSlot(off);
+        if (slot < FAKE_FONT_MAX)
         {
-            FakeFont* f = &g_fake[i];
-            if (f->state == 2 && f->official == off)
+            FakeFont* f = &g_fake[slot];
+            if (f->state == 2)
             {
-                if ((*g_fontTabPtr)[i] == off) return f->obj;
+                // 校验官方对象仍在槽位（引擎重建字体则回退官方, 防悬空）
+                void* cur = (*g_fontTabPtr)[slot];
+                if (cur == f->official) return f->obj;
                 f->state = 4;
+                return cur;
             }
         }
     }
@@ -531,6 +522,8 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
 // ---------- 渲染线程阶段: 官方图集读回 + 拼接 + D3D 创建 + 伪对象组装 ----------
 static bool FinishFont(FakeFont* f)
 {
+    // 并发守卫: 只允许一个线程从 state 3 进入构建（5=building）
+    if (InterlockedCompareExchange(&f->state, 5, 3) != 3) return false;
     uint32_t fontId = f->fontId;
     uint8_t* off = static_cast<uint8_t*>(f->official);
 
@@ -708,17 +701,53 @@ static bool FinishFont(FakeFont* f)
 }
 
 // ---------- 请求升级字体（渲染线程, DrawWide 内调用） ----------
-static void RequestFont(uint32_t fontId)
+// slot: fontTab 槽位号（已规范化, 非 DrawWide 原始 fontId）
+static void RequestFont(uint32_t slot)
 {
     if (!g_stbReady || !g_dictReady) return;
-    if (fontId >= FAKE_FONT_MAX) return;
-    FakeFont* f = &g_fake[fontId];
+    if (slot >= FAKE_FONT_MAX) return;
+    FakeFont* f = &g_fake[slot];
     LONG st = f->state;
     if (st != 0) return;
     if (InterlockedCompareExchange(&f->state, 1, 0) != 0) return;
-    f->fontId = fontId;
-    Log("font%u: upgrade requested (first CJK text)", fontId);
+    f->fontId = slot;
+    Log("font%u: upgrade requested (first CJK text)", slot);
     CloseHandle(CreateThread(nullptr, 0, RasterizeThread, f, 0, nullptr));
+}
+
+// 官方对象 -> fontTab 槽位号（找不到返回 0xFFFFFFFF）
+static uint32_t ResolveSlot(void* off)
+{
+    if (!g_fontTabPtr || !off) return 0xFFFFFFFFu;
+    int n = *g_fontCountPtr;
+    if (n < 0) return 0xFFFFFFFFu;
+    if (n > (int)FAKE_FONT_MAX) n = (int)FAKE_FONT_MAX;
+    for (int i = 0; i < n; ++i)
+        if ((*g_fontTabPtr)[i] == off) return (uint32_t)i;
+    return 0xFFFFFFFFu;
+}
+
+// DrawWide 命中含中文译文时调用: 规范化 fontId（-1/负组编码/槽位）-> 槽位 -> 触发/推进
+static void EnsureFontFor(unsigned int rawFontId)
+{
+    if (!g_stbReady || !g_dictReady) return;
+    void* off = g_origFontLookup((int)rawFontId);
+    if (!off) return;
+    // 已跟踪的字体直接推进（避免每帧线性扫 fontTab）
+    for (uint32_t i = 0; i < FAKE_FONT_MAX; ++i)
+    {
+        FakeFont* f = &g_fake[i];
+        if (f->state != 0 && f->official == off)
+        {
+            if (f->state == 3) FinishFont(f);   // 光栅化完, 渲染线程做 D3D 阶段
+            return;
+        }
+    }
+    // 新字体: 反查槽位号后触发
+    uint32_t slot = ResolveSlot(off);
+    if (slot == 0xFFFFFFFFu) return;
+    FakeFont* f = &g_fake[slot];
+    if (f->state == 0) RequestFont(slot);
 }
 
 // ---------- 字体初始化线程: 读 TTF + stbtt_InitFont ----------
@@ -808,12 +837,7 @@ static __int64 __fastcall HookDrawWide(void* a1, float x, float y, const wchar_t
         {
             text = r->trans;
             if (r->hasCjk)
-            {
-                // 含中文译文: 确保该字体已升级 + 完成挂起的 D3D 阶段
-                FakeFont* f = (fontId < FAKE_FONT_MAX) ? &g_fake[fontId] : nullptr;
-                if (f && f->state == 3) FinishFont(f);
-                else if (f && f->state == 0) RequestFont(fontId);
-            }
+                EnsureFontFor(fontId);   // 规范化 -1/负组编码/槽位后触发
         }
     }
     return g_origDrawWide(a1, x, y, text, scale, flag, fontId, a8);
