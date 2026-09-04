@@ -552,6 +552,236 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     return 0;
 }
 
+// ---------- DXGI 格式辅助（v6.4: 官方图集读回格式感知） ----------
+// 返回每像素字节数; 压缩/未知格式返回 0
+static uint32_t BppOf(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return 4;
+    case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+    case DXGI_FORMAT_B4G4R4A4_UNORM:
+        return 2;
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static bool IsBcFormat(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC4_SNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static const char* FmtName(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return "BGRX8";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+    case DXGI_FORMAT_B5G6R5_UNORM:   return "B5G6R5";
+    case DXGI_FORMAT_B5G5R5A1_UNORM: return "B5G5R5A1";
+    case DXGI_FORMAT_B4G4R4A4_UNORM: return "B4G4R4A4";
+    case DXGI_FORMAT_R8_UNORM:       return "R8";
+    case DXGI_FORMAT_A8_UNORM:       return "A8";
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC1_UNORM_SRGB: return "BC1";
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM_SRGB: return "BC2";
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM_SRGB: return "BC3";
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC4_SNORM:      return "BC4";
+    default:                          return "?";
+    }
+}
+
+// BC 块字节数
+static uint32_t BcBlockBytes(DXGI_FORMAT fmt)
+{
+    // BC1/BC4: 8B/块; BC2/BC3: 16B/块
+    return (fmt == DXGI_FORMAT_BC1_UNORM || fmt == DXGI_FORMAT_BC1_TYPELESS ||
+            fmt == DXGI_FORMAT_BC1_UNORM_SRGB ||
+            fmt == DXGI_FORMAT_BC4_UNORM || fmt == DXGI_FORMAT_BC4_TYPELESS ||
+            fmt == DXGI_FORMAT_BC4_SNORM)
+               ? 8u : 16u;
+}
+
+static inline uint32_t Rgb565(uint16_t v, uint8_t* r, uint8_t* g, uint8_t* b)
+{
+    *r = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);
+    *g = (uint8_t)(((v >> 5)  & 0x3F) * 255 / 63);
+    *b = (uint8_t)(( v        & 0x1F) * 255 / 31);
+    return 0;
+}
+
+// BC1(DXT1) 单块解码 -> 4x4 BGRA
+static void DecodeBc1(const uint8_t* blk, uint32_t* out16)
+{
+    uint16_t c0 = blk[0] | (blk[1] << 8);
+    uint16_t c1 = blk[2] | (blk[3] << 8);
+    uint8_t r0, g0, b0, r1, g1, b1;
+    Rgb565(c0, &r0, &g0, &b0);
+    Rgb565(c1, &r1, &g1, &b1);
+    uint32_t pal[4];
+    pal[0] = 0xFF000000u | (b0 << 16) | (g0 << 8) | r0;
+    pal[1] = 0xFF000000u | (b1 << 16) | (g1 << 8) | r1;
+    if (c0 > c1)
+    {
+        pal[2] = 0xFF000000u | ((((b0 + b0 + b1) / 3) & 0xFF) << 16)
+                           | ((((g0 + g0 + g1) / 3) & 0xFF) << 8)
+                           | (((r0 + r0 + r1) / 3) & 0xFF);
+        pal[3] = 0xFF000000u | (((b0 + b1 + b1) / 3) << 16)
+                           | (((g0 + g1 + g1) / 3) << 8)
+                           | (((r0 + r1 + r1) / 3) & 0xFF);
+    }
+    else
+    {
+        pal[2] = 0xFF000000u | (((b0 + b1) / 2) << 16) | (((g0 + g1) / 2) << 8) | ((r0 + r1) / 2);
+        pal[3] = 0x00000000u;   // 透明黑
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32_t bits = blk[4 + i];
+        for (int j = 0; j < 4; ++j)
+            out16[i * 4 + j] = pal[(bits >> (j * 2)) & 3];
+    }
+}
+
+// BC2(DXT3) 单块解码: 显式 4bit alpha + BC1 色
+static void DecodeBc2(const uint8_t* blk, uint32_t* out16)
+{
+    DecodeBc1(blk + 8, out16);
+    for (int i = 0; i < 16; ++i)   // 像素 i 的 4bit alpha: 字节 i>>1, 半字节 (i&1)*4
+    {
+        uint8_t byte = blk[i >> 1];
+        uint8_t nib  = (i & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+        uint8_t a    = (uint8_t)(nib * 17);   // 0..15 -> 0..255
+        out16[i] = (out16[i] & 0x00FFFFFFu) | ((uint32_t)a << 24);
+    }
+}
+
+// BC3(DXT5) 单块解码: 8-alpha 插值 + BC1 色
+static void DecodeBc3(const uint8_t* blk, uint32_t* out16)
+{
+    DecodeBc1(blk + 8, out16);
+    uint8_t a[8];
+    a[0] = blk[0];
+    a[1] = blk[1];
+    if (a[0] > a[1])
+    {
+        for (int i = 0; i < 6; ++i) a[2 + i] = (uint8_t)(((6 - i) * a[0] + (1 + i) * a[1]) / 7);
+    }
+    else
+    {
+        for (int i = 0; i < 4; ++i) a[2 + i] = (uint8_t)(((4 - i) * a[0] + (1 + i) * a[1]) / 5);
+        a[6] = 0; a[7] = 255;
+    }
+    // 16 个 3bit 索引, 48bit 从 blk[2..7], 每像素低位在前（跨字节时拼两字节, 尾块不越界）
+    for (int i = 0; i < 16; ++i)
+    {
+        int bit = i * 3;
+        int byteIdx = 2 + (bit >> 3);
+        uint32_t v = blk[byteIdx];
+        if (byteIdx < 7 && (bit & 7) > 5) v |= (uint32_t)blk[byteIdx + 1] << 8;
+        uint8_t al = a[(v >> (bit & 7)) & 7];
+        out16[i] = (out16[i] & 0x00FFFFFFu) | ((uint32_t)al << 24);
+    }
+}
+
+// BC4 单块解码 -> 4x4, 取 R 通道复制到 BGRA（灰度语义）
+static void DecodeBc4(const uint8_t* blk, uint32_t* out16)
+{
+    uint8_t r[8];
+    r[0] = blk[0];
+    r[1] = blk[1];
+    if (r[0] > r[1])
+    {
+        for (int i = 0; i < 6; ++i) r[2 + i] = (uint8_t)(((6 - i) * r[0] + (1 + i) * r[1]) / 7);
+    }
+    else
+    {
+        for (int i = 0; i < 4; ++i) r[2 + i] = (uint8_t)(((4 - i) * r[0] + (1 + i) * r[1]) / 5);
+        r[6] = 0; r[7] = 255;
+    }
+    for (int i = 0; i < 16; ++i)
+    {
+        int bit = i * 3;
+        int byteIdx = 2 + (bit >> 3);
+        uint32_t v = blk[byteIdx];
+        if (byteIdx < 7 && (bit & 7) > 5) v |= (uint32_t)blk[byteIdx + 1] << 8;
+        uint8_t g = r[(v >> (bit & 7)) & 7];
+        out16[i] = 0xFF000000u | ((uint32_t)g << 16) | ((uint32_t)g << 8) | g;
+    }
+}
+
+// BC 纹理按块行解码: 解一个 4 像素高条带（每块只解一次）, 写入 atlas 的 [y0,y0+4) 行
+// （宽 W 裁剪, 高 hMax 裁剪; atlas 为 BGRA, pitch 字节）
+static void DecodeBcStrip(DXGI_FORMAT fmt, const uint8_t* src, uint32_t srcRowBytes,
+                          uint32_t blockY, uint32_t W, uint32_t hMax,
+                          uint8_t* atlas, uint32_t pitch)
+{
+    uint32_t blocksX = (W + 3) >> 2;
+    uint32_t bb      = BcBlockBytes(fmt);
+    const uint8_t* rowBlk = src + (SIZE_T)blockY * srcRowBytes;
+    uint32_t y0 = blockY * 4;
+    uint32_t tmp[16];
+    for (uint32_t bx = 0; bx < blocksX; ++bx)
+    {
+        const uint8_t* blk = rowBlk + (SIZE_T)bx * bb;
+        switch (fmt)
+        {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM_SRGB:
+            DecodeBc1(blk, tmp); break;
+        case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM_SRGB:
+            DecodeBc2(blk, tmp); break;
+        case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM_SRGB:
+            DecodeBc3(blk, tmp); break;
+        case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_TYPELESS:
+            DecodeBc4(blk, tmp); break;
+        default:
+            memset(tmp, 0, sizeof(tmp)); break;
+        }
+        uint32_t x0 = bx * 4;
+        for (uint32_t r = 0; r < 4; ++r)
+        {
+            uint32_t y = y0 + r;
+            if (y >= hMax) break;
+            uint32_t* dst = (uint32_t*)(atlas + (SIZE_T)y * pitch);
+            for (uint32_t c = 0; c < 4; ++c)
+                if (x0 + c < W) dst[x0 + c] = tmp[r * 4 + c];
+        }
+    }
+}
+
 // ---------- 渲染线程阶段: 官方图集读回 + 拼接 + D3D 创建 + 伪对象组装 ----------
 static bool FinishFont(FakeFont* f)
 {
@@ -591,9 +821,9 @@ static bool FinishFont(FakeFont* f)
     if (perRow == 0) { Log("font%u: atlas width %u < cellW %u, abort", fontId, W, f->cellW); srcTex->Release(); f->state = 4; return false; }
     uint32_t rows = (f->nCells + perRow - 1) / perRow;
     uint32_t H = offH + rows * f->cellH;
-    if (H > 65535)
+    if (H > 16384)   // D3D11 纹理最大维度
     {
-        rows = (65535 - offH) / f->cellH;
+        rows = (16384 - offH) / f->cellH;
         H = offH + rows * f->cellH;
         f->nCells = f->nCells < rows * perRow ? f->nCells : rows * perRow;
         Log("font%u: atlas height clamped to %u (%u cells)", fontId, H, f->nCells);
@@ -627,25 +857,87 @@ static bool FinishFont(FakeFont* f)
         f->state = 4;
         return false;
     }
-    for (uint32_t row = 0; row < offH; ++row)
-        memcpy(atlas + (SIZE_T)row * pitch,
-               (uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch, pitch);
+
+    // 格式信息前置记录（拷贝循环前, 崩溃也能拿到）
+    Log("font%u: atlas %ux%u fmt=%s(%u) mips=%u arr=%u RowPitch=%u (dd.pitch=%u)",
+        fontId, W, offH, FmtName(dd.Format), (unsigned)dd.Format,
+        dd.MipLevels, dd.ArraySize, ms.RowPitch, W * 4);
+
+    // 格式感知读回 -> atlas 统一为 BGRA8
+    bool     bc  = IsBcFormat(dd.Format);
+    uint32_t bpp = BppOf(dd.Format);
+    if (!bc && bpp == 0)
+    {
+        Log("font%u: unsupported format %s(%u), graceful abort (official font kept)",
+            fontId, FmtName(dd.Format), (unsigned)dd.Format);
+        ctx->Unmap(stag, 0);
+        stag->Release();
+        VirtualFree(atlas, 0, MEM_RELEASE);
+        f->state = 4;
+        return false;
+    }
+
+    if (bc)
+    {
+        uint32_t blocksY = (offH + 3) >> 2;
+        for (uint32_t by = 0; by < blocksY; ++by)
+            DecodeBcStrip(dd.Format, (const uint8_t*)ms.pData, ms.RowPitch,
+                          by, W, offH, atlas, pitch);
+    }
+    else if (bpp == 4)
+    {
+        for (uint32_t row = 0; row < offH; ++row)
+            memcpy(atlas + (SIZE_T)row * pitch,
+                   (const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch, (SIZE_T)W * 4);
+    }
+    else if (bpp == 2)
+    {
+        for (uint32_t row = 0; row < offH; ++row)
+        {
+            const uint16_t* s = (const uint16_t*)((const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch);
+            uint32_t* d = (uint32_t*)(atlas + (SIZE_T)row * pitch);
+            for (uint32_t x = 0; x < W; ++x)
+            {
+                uint16_t v = s[x];
+                uint8_t r = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);
+                uint8_t g = (uint8_t)(((v >> 5)  & 0x3F) * 255 / 63);
+                uint8_t b = (uint8_t)(( v        & 0x1F) * 255 / 31);
+                uint8_t a = (dd.Format == DXGI_FORMAT_B5G5R5A1_UNORM) ? (uint8_t)(((v >> 15) & 1) * 255)
+                          : (dd.Format == DXGI_FORMAT_B4G4R4A4_UNORM) ? (uint8_t)(((v >> 12) & 0xF) * 17)
+                          : 255;
+                d[x] = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
+            }
+        }
+    }
+    else   // bpp == 1 (R8/A8): 灰度展开, 覆盖值进全部通道（兼容任意采样通道）
+    {
+        for (uint32_t row = 0; row < offH; ++row)
+        {
+            const uint8_t* s = (const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch;
+            uint32_t* d = (uint32_t*)(atlas + (SIZE_T)row * pitch);
+            for (uint32_t x = 0; x < W; ++x)
+            {
+                uint32_t c = s[x];
+                d[x] = (c << 24) | (c << 16) | (c << 8) | c;
+            }
+        }
+    }
     ctx->Unmap(stag, 0);
     stag->Release();
 
-    // 官方图集像素样本（调试: 判断字形存储格式）
+    // 官方图集像素样本（调试: 判断字形存储格式/覆盖通道语义）
     {
         uint32_t sx = *(uint32_t*)((uint8_t*)offXtab + 4 * ('W' - 0x20));
         uint32_t sy = *(uint32_t*)((uint8_t*)offYtab + 4 * ('W' - 0x20));
         if (sx + 8 < W && sy + 8 < offH)
         {
             uint32_t* px = (uint32_t*)(atlas + (SIZE_T)sy * pitch + (SIZE_T)sx * 4);
-            Log("font%u: atlas %ux%u fmt=%u, sample W@(%u,%u): %08X %08X %08X",
-                fontId, W, offH, (unsigned)dd.Format, sx, sy, px[0], px[1], px[pitch / 8]);
+            Log("font%u: sample W@(%u,%u): %08X %08X %08X %08X",
+                fontId, sx, sy, px[0], px[1], px[pitch / 8], px[pitch / 8 + 1]);
         }
     }
 
-    // 2) 中文区 blit（灰度 -> BGRA 白字）
+    // 2) 中文区 blit（灰度 -> BGRA, 覆盖值进全部通道: 无论 shader 采 .r/.a 都正确）
     for (uint32_t i = 0; i < f->nCells; ++i)
     {
         uint32_t cx = (i % perRow) * f->cellW;
@@ -656,16 +948,22 @@ static bool FinishFont(FakeFont* f)
             uint32_t* dst = (uint32_t*)(atlas + (SIZE_T)(cy + r) * pitch + (SIZE_T)cx * 4);
             const uint8_t* src = cell + (SIZE_T)r * f->cellW;
             for (uint32_t c = 0; c < f->cellW; ++c)
-                dst[c] = 0x00FFFFFFu | ((uint32_t)src[c] << 24);   // B=G=R=255, A=coverage
+            {
+                uint32_t cov = src[c];
+                dst[c] = (cov << 24) | (cov << 16) | (cov << 8) | cov;
+            }
         }
     }
 
-    // 3) 创建纹理 + SRV
+    // 3) 创建纹理 + SRV（显式 BGRA8: 不继承官方压缩格式, 上传数据即 atlas 布局）
     D3D11_TEXTURE2D_DESC nd = dd;
     nd.Width     = W;
     nd.Height    = H;
     nd.MipLevels = 1;
     nd.ArraySize = 1;
+    nd.Format          = DXGI_FORMAT_B8G8R8A8_UNORM;
+    nd.SampleDesc.Count = 1;
+    nd.SampleDesc.Quality = 0;
     nd.Usage          = D3D11_USAGE_DEFAULT;
     nd.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
     nd.CPUAccessFlags = 0;
