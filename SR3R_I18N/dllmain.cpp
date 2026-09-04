@@ -3,7 +3,7 @@
 // v6 = v5 文本替换层 + 运行时中文字形渲染层（零资源文件改动）
 //
 //  [文本层 v5]
-//   1. 加载 scripts\text.btxt（BEXT 词典: 英文原文 -> 中文译文）
+//   1. 加载 scripts\<dict>\*.txt（le_strings 格式: "英文原文": "中文译文"; SR3R_I18N.ini 可配置）
 //   2. Hook A  sub_1408B5FF0  宽字符绘制核心   — R9  = 文本指针 -> 查词典替换
 //   3. Hook B  sub_140812610  Volition formatter — RDX = 格式串 -> 查词典替换
 //   4. DumpText.dtxt 未命中文本去重收集（仅英文，过滤 CJK）
@@ -75,7 +75,7 @@ static constexpr uint32_t FAKE_FONT_MAX    = 256;
 static constexpr uint32_t FAKE_GLYPHS      = 0xFFE0u;       // 0x20..0xFFFF 全覆盖
 static constexpr uint32_t FONT_BASECHAR_DEFAULT = 0x20u;
 
-static constexpr size_t ARENA_BYTES   = 8u << 20;
+static constexpr size_t ARENA_BYTES   = 128u << 20;   // 词典字符串区（几万条译文上限安全值）
 static constexpr uint32_t DICT_BUCKETS = 1u << 15;
 static constexpr uint32_t DUMP_BUCKETS = 1u << 12;
 static constexpr size_t DUMP_MAX_CHARS = 256;
@@ -117,6 +117,77 @@ static void Log(const char* fmt, ...)
     fputc('\n', g_log);
     fflush(g_log);
     LeaveCriticalSection(&g_logCS);
+}
+
+// ---------- 配置（SR3R_I18N.ini, 与 asi 同目录; 缺失时用默认值） ----------
+struct Config
+{
+    wchar_t dictDir[MAX_PATH];    // 词典文件夹（相对 asi 目录）
+    wchar_t fontFile[MAX_PATH];   // 字体 TTF 文件名（相对 asi 目录）
+    bool     dumpEnabled;         // 未命中文本收集（DumpText.dtxt）
+};
+
+static Config g_cfg = {
+    L"dict",                       // 默认: scripts/dict/
+    L"SourceHanSansHWSC-VF.ttf",   // 默认字体
+    true,
+};
+
+// UTF-8 无 BOM/带 BOM ini 行解析（手工实现, 避免路径中文问题）
+static void LoadConfig(const wchar_t* iniPath)
+{
+    HANDLE f = CreateFileW(iniPath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("cfg: %ls not found, defaults", iniPath); return; }
+    LARGE_INTEGER sz;
+    GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (1 << 20)) { CloseHandle(f); return; }
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, (SIZE_T)sz.QuadPart,
+                                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    DWORD rd = 0;
+    BOOL ok = buf && ReadFile(f, buf, (DWORD)sz.QuadPart, &rd, nullptr);
+    CloseHandle(f);
+    if (!ok) { if (buf) VirtualFree(buf, 0, MEM_RELEASE); return; }
+
+    // UTF-8 -> UTF-16（跳 BOM）
+    int utf8Off = (rd >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off,
+                                   (int)(rd - utf8Off), nullptr, 0);
+    if (wlen <= 0 || wlen > 65536) { VirtualFree(buf, 0, MEM_RELEASE); return; }
+    auto* wbuf = static_cast<wchar_t*>(VirtualAlloc(nullptr, (wlen + 1) * sizeof(wchar_t),
+                                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!wbuf) { VirtualFree(buf, 0, MEM_RELEASE); return; }
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off, (int)(rd - utf8Off), wbuf, wlen);
+    wbuf[wlen] = L'\0';
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    // 逐行取 key=value（忽略节名/注释/空行）
+    wchar_t* ctx = nullptr;
+    wchar_t* line = wcstok_s(wbuf, L"\r\n", &ctx);
+    while (line)
+    {
+        wchar_t* eq = wcschr(line, L'=');
+        if (!eq) { line = wcstok_s(nullptr, L"\r\n", &ctx); continue; }
+        *eq = L'\0';
+        wchar_t* key = line;
+        wchar_t* val = eq + 1;
+        // 去首尾空白
+        while (*key == L' ' || *key == L'\t') ++key;
+        wchar_t* ke = key + wcslen(key);
+        while (ke > key && (ke[-1] == L' ' || ke[-1] == L'\t')) *--ke = L'\0';
+        while (*val == L' ' || *val == L'\t') ++val;
+        wchar_t* ve = val + wcslen(val);
+        while (ve > val && (ve[-1] == L' ' || ve[-1] == L'\t')) *--ve = L'\0';
+
+        if (_wcsicmp(key, L"dict_dir") == 0)         wcscpy_s(g_cfg.dictDir, val);
+        else if (_wcsicmp(key, L"font_file") == 0)   wcscpy_s(g_cfg.fontFile, val);
+        else if (_wcsicmp(key, L"dump_enabled") == 0) g_cfg.dumpEnabled = (*val != L'0');
+
+        line = wcstok_s(nullptr, L"\r\n", &ctx);
+    }
+    VirtualFree(wbuf, 0, MEM_RELEASE);
+    Log("cfg: %ls loaded (dict_dir=%ls font_file=%ls dump=%d)",
+        iniPath, g_cfg.dictDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled);
 }
 
 // ---------- CRC-32 (IEEE 反射, 与 zlib.crc32 一致) ----------
@@ -259,6 +330,7 @@ static bool DumpWorthy(const wchar_t* s, size_t len)
 
 static void DumpText(const wchar_t* s, size_t len)
 {
+    if (!g_cfg.dumpEnabled) return;
     uint32_t crc = CrcText(s, len);
     AcquireSRWLockExclusive(&g_dumpLock);
     if (g_dumpBuckets && g_dumpFile)
@@ -1172,21 +1244,22 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
     for (const wchar_t* p = extra; *p; ++p) CharSetAdd(*p);
     Log("font: charset %u chars (dict) + extras", g_charCount);
 
-    // 读 TTF
-    wchar_t ttf1[MAX_PATH], ttf2[MAX_PATH];
-    wcscpy_s(ttf1, dir); wcscat_s(ttf1, L"\\font.ttf");
-    wcscpy_s(ttf2, dir); wcscat_s(ttf2, L"\\SourceHanSansHWSC-VF.ttf");
+    // 读 TTF（ini 字体文件名; 兼容旧名 font.ttf）
+    wchar_t ttf[MAX_PATH];
+    _snwprintf_s(ttf, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, g_cfg.fontFile);
 
-    HANDLE f = CreateFileW(ttf2, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    wchar_t* used = ttf2;
+    HANDLE f = CreateFileW(ttf, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE)
     {
+        // 兼容: ini 未配置时的默认名
+        wchar_t ttf1[MAX_PATH];
+        wcscpy_s(ttf1, dir); wcscat_s(ttf1, L"\\font.ttf");
         f = CreateFileW(ttf1, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-        used = ttf1;
+        wcscpy_s(ttf, ttf1);
     }
     if (f == INVALID_HANDLE_VALUE)
     {
-        Log("font: %ls / font.ttf not found, glyph layer disabled (GLE=%lu)", ttf2, GetLastError());
+        Log("font: %ls not found, glyph layer disabled (GLE=%lu)", ttf, GetLastError());
         return 0;
     }
     LARGE_INTEGER sz;
@@ -1207,7 +1280,7 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
         if (g_ttfBuf) { VirtualFree(g_ttfBuf, 0, MEM_RELEASE); g_ttfBuf = nullptr; }
         return 0;
     }
-    Log("font: %ls (%u bytes)", used, rd);
+    Log("font: %ls (%u bytes)", ttf, rd);
 
     if (!stbtt_InitFont(&g_stb, g_ttfBuf, 0))
     {
@@ -1256,68 +1329,176 @@ static __int64 __fastcall HookFormat(wchar_t* dst, const wchar_t* fmt,
     return g_origFormat(dst, fmt, cap, args, argc);
 }
 
-// ---------- BEXT 词典加载 ----------
-static bool LoadBext(const uint8_t* buf, size_t size)
+// ---------- txt 词典加载（le_strings 格式: "KEY": "VALUE", KEY=英文原文/槽位名） ----------
+// 格式规则（与 schinese/*.txt 游戏原生格式一致）:
+//   - 每行 "KEY": "VALUE";  引号内的 \\ \" \n 为转义
+//   - HASH_xxxxxxxx 键 = 引擎字符串槽位名（值不是查表键）, 跳过不插入哈希表
+//   - 值为空 / 纯 ASCII 值跳过（无翻译意义）; KEY 与值相同跳过
+struct LeLine
 {
-    if (size < 12) { Log("BEXT: too small"); return false; }
-    uint32_t magic, reserved, count;
-    memcpy(&magic,    buf + 0, 4);
-    memcpy(&reserved, buf + 4, 4);
-    memcpy(&count,    buf + 8, 4);
-    if (magic != 0x54584542u) { Log("BEXT: bad magic %08X", magic); return false; }
+    wchar_t* key;
+    wchar_t* val;
+};
 
-    size_t off = 12;
-    uint32_t loaded = 0, trimKeys = 0, cjkEntries = 0;
+// 解析 "KEY": "VALUE" 行（内存内原地反转义）; 返回 false = 非条目行
+static bool ParseLeLine(wchar_t* line, LeLine* out)
+{
+    wchar_t* p = line;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p != L'"') return false;
+    ++p;
+    wchar_t* key = p;
+    // KEY 内转义在 le_strings 键中不存在（键为消息名/原文, 无引号）; 找闭合引号
+    while (*p && *p != L'"') ++p;
+    if (!*p) return false;
+    *p = L'\0';
+    ++p;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p != L':') return false;
+    ++p;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p != L'"') return false;
+    ++p;
+    wchar_t* val = p;
 
-    for (uint32_t i = 0; i < count; ++i)
+    // 值反转义（\\ \" \n）, 原地写
+    wchar_t* w = p;
+    while (*p)
     {
-        const char* fields[3];
-        uint32_t    fLens[3];
-        bool ok = true;
-        for (int k = 0; k < 3; ++k)
+        if (*p == L'\\')
         {
-            uint32_t l;
-            if (off + 4 > size) { ok = false; break; }
-            memcpy(&l, buf + off, 4); off += 4;
-            if (l == 0 || off + l > size) { ok = false; break; }
-            fields[k] = reinterpret_cast<const char*>(buf + off);
-            fLens[k]  = l;
-            off += l;
+            ++p;
+            if      (*p == L'n')  *w++ = L'\n';
+            else if (*p == L'\\') *w++ = L'\\';
+            else if (*p == L'"')  *w++ = L'"';
+            else if (*p)          *w++ = *p;   // 未知转义按原样
+            else break;
+            ++p;
         }
-        if (!ok) { Log("BEXT: truncated at entry %u", i); break; }
-
-        const char* origUtf8  = fields[1]; uint32_t origLen  = fLens[1] - 1;
-        const char* transUtf8 = fields[2]; uint32_t transLen = fLens[2] - 1;
-        if (origLen == 0 || transLen == 0) continue;
-
-        int on = MultiByteToWideChar(CP_UTF8, 0, origUtf8, (int)origLen, nullptr, 0);
-        int tn = MultiByteToWideChar(CP_UTF8, 0, transUtf8, (int)transLen, nullptr, 0);
-        if (on <= 0 || tn <= 0 || on > 4096 || tn > 4096) continue;
-
-        auto* transW = static_cast<wchar_t*>(ArenaAlloc((tn + 1) * sizeof(wchar_t)));
-        auto* origW  = static_cast<wchar_t*>(ArenaAlloc((on + 1) * sizeof(wchar_t)));
-        if (!transW || !origW) { Log("BEXT: arena exhausted at %u", i); break; }
-        MultiByteToWideChar(CP_UTF8, 0, transUtf8, (int)transLen, transW, tn);
-        transW[tn] = L'\0';
-        MultiByteToWideChar(CP_UTF8, 0, origUtf8, (int)origLen, origW, on);
-        origW[on] = L'\0';
-
-        // v6: 收集译文非 ASCII 字符集
-        bool hasCjk = false;
-        for (const wchar_t* p = transW; *p; ++p)
-            if (*p >= 0x80) { CharSetAdd(*p); hasCjk = true; }
-        if (hasCjk) ++cjkEntries;
-
-        if (DictInsert(origW, (uint32_t)on, transW)) ++loaded;
-        size_t b, tl;
-        if (TrimRange(origW, (size_t)on, &b, &tl) && !(b == 0 && tl == (size_t)on))
+        else if (*p == L'"')   // 闭合引号, 值结束
         {
-            if (DictInsert(origW + b, (uint32_t)tl, transW)) ++trimKeys;
+            *w = L'\0';
+            out->key = key;
+            out->val = val;
+            return true;
         }
+        else *w++ = *p++;
     }
-    Log("BEXT: %u entries, loaded %u keys (+%u trim), %u cjk, charset %u, arena %zu/%zu KB",
-        count, loaded, trimKeys, cjkEntries, g_charCount, g_arenaUsed >> 10, ARENA_BYTES >> 10);
-    return loaded > 0;
+    return false;   // 未闭合
+}
+
+// 处理一条 key/val: HASH_ 键跳过; 过滤无意义条目; 入表
+static void AddDictEntry(const wchar_t* key, const wchar_t* val,
+                         uint32_t* loaded, uint32_t* hashKeys, uint32_t* cjkEntries)
+{
+    size_t on = wcslen(key), tn = wcslen(val);
+    if (on == 0 || tn == 0 || on > 4096 || tn > 4096) return;
+    if (on > 5 && _wcsnicmp(key, L"HASH_", 5) == 0) { ++*hashKeys; return; }  // 槽位名, 不参与运行时查表
+
+    auto* transW = static_cast<wchar_t*>(ArenaAlloc((tn + 1) * sizeof(wchar_t)));
+    if (!transW) return;
+    memcpy(transW, val, tn * sizeof(wchar_t));
+    transW[tn] = L'\0';
+
+    // 收集译文非 ASCII 字符集
+    bool hasCjk = false;
+    for (const wchar_t* p = transW; *p; ++p)
+        if (*p >= 0x80) { CharSetAdd(*p); hasCjk = true; }
+    if (hasCjk) ++*cjkEntries;
+
+    auto* origW = static_cast<wchar_t*>(ArenaAlloc((on + 1) * sizeof(wchar_t)));
+    if (!origW) return;
+    memcpy(origW, key, on * sizeof(wchar_t));
+    origW[on] = L'\0';
+
+    if (DictInsert(origW, (uint32_t)on, transW)) ++*loaded;
+    size_t b, tl;
+    if (TrimRange(origW, (size_t)on, &b, &tl) && !(b == 0 && tl == (size_t)on))
+    {
+        if (DictInsert(origW + b, (uint32_t)tl, transW)) ++*loaded;   // 计入 trim 键
+    }
+}
+
+// 加载一个 txt 文件（UTF-8, 带/不带 BOM; CRLF/LF）
+static bool LoadDictFile(const wchar_t* path, uint32_t* loaded, uint32_t* hashKeys,
+                         uint32_t* cjkEntries, uint32_t* lineCount, uint32_t* badLines)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (32 << 20))
+    { Log("dict: %ls bad size %lld", path, sz.QuadPart); CloseHandle(f); return false; }
+
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, (SIZE_T)sz.QuadPart,
+                                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    DWORD rd = 0;
+    BOOL ok = buf && ReadFile(f, buf, (DWORD)sz.QuadPart, &rd, nullptr);
+    CloseHandle(f);
+    if (!ok || rd != (DWORD)sz.QuadPart)
+    { if (buf) VirtualFree(buf, 0, MEM_RELEASE); return false; }
+
+    int utf8Off = (rd >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off,
+                                   (int)(rd - utf8Off), nullptr, 0);
+    if (wlen <= 0)
+    { Log("dict: %ls not valid UTF-8", path); VirtualFree(buf, 0, MEM_RELEASE); return false; }
+    auto* wbuf = static_cast<wchar_t*>(VirtualAlloc(nullptr, (wlen + 2) * sizeof(wchar_t),
+                                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!wbuf) { VirtualFree(buf, 0, MEM_RELEASE); return false; }
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off, (int)(rd - utf8Off), wbuf, wlen);
+    wbuf[wlen] = L'\0';
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    wchar_t* ctx = nullptr;
+    wchar_t* line = wcstok_s(wbuf, L"\r\n", &ctx);
+    while (line)
+    {
+        ++*lineCount;
+        LeLine le;
+        if (ParseLeLine(line, &le))
+            AddDictEntry(le.key, le.val, loaded, hashKeys, cjkEntries);
+        else
+        {
+            // 空行/尾逗号行等非条目不算错误; 只有含引号但解析失败才计
+            wchar_t* q = wcschr(line, L'"');
+            if (q) { ++*badLines; if (*badLines <= 5) Log("dict: %ls bad line: %.60ls", path, line); }
+        }
+        line = wcstok_s(nullptr, L"\r\n", &ctx);
+    }
+    VirtualFree(wbuf, 0, MEM_RELEASE);
+    return true;
+}
+
+// 扫描词典文件夹（*.txt; 按 FindFirstFile 字典序, 后加载的同键覆盖前面 = 头插哈希表）
+static bool LoadDictDir(const wchar_t* dir, uint32_t* outFiles, uint32_t* outLoaded,
+                        uint32_t* outHash, uint32_t* outCjk)
+{
+    wchar_t pat[MAX_PATH];
+    _snwprintf_s(pat, MAX_PATH, _TRUNCATE, L"%ls\\*.txt", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        Log("dict: folder %ls not found (GLE=%lu)", dir, GetLastError());
+        return false;
+    }
+    uint32_t files = 0, loaded = 0, hashKeys = 0, cjkEntries = 0, badLines = 0, lines = 0;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, fd.cFileName);
+        if (LoadDictFile(path, &loaded, &hashKeys, &cjkEntries, &lines, &badLines))
+            ++files;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    Log("dict: %u files, %u lines, %u keys, %u HASH_ skipped, %u cjk, %u bad, arena %zu/%zu KB",
+        files, lines, loaded, hashKeys, cjkEntries, badLines,
+        g_arenaUsed >> 10, ARENA_BYTES >> 10);
+    *outFiles = files; *outLoaded = loaded; *outHash = hashKeys; *outCjk = cjkEntries;
+    return files > 0 && loaded > 0;
 }
 
 // ---------- 统计线程 ----------
@@ -1358,39 +1539,20 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v6: text replacement + CJK glyph layer ====");
+    Log("==== SR3R_I18N v7: text replacement + CJK glyph layer (txt dict) ====");
 
-    wchar_t dir[MAX_PATH], btxt[MAX_PATH], dtxt[MAX_PATH];
+    wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = L'\0'; else *dir = L'\0';
-    wcscpy_s(btxt, dir); wcscat_s(btxt, L"\\text.btxt");
+
+    wcscpy_s(iniPath, dir); wcscat_s(iniPath, L"\\SR3R_I18N.ini");
+    LoadConfig(iniPath);
+
+    _snwprintf_s(dictDir, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, g_cfg.dictDir);
     wcscpy_s(dtxt, dir); wcscat_s(dtxt, L"\\DumpText.dtxt");
 
-    // 1. 词典
-    HANDLE f = CreateFileW(btxt, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE)
-    {
-        Log("dict: %ls not found (GLE=%lu), idle mode", btxt, GetLastError());
-        return 0;
-    }
-    LARGE_INTEGER sz;
-    GetFileSizeEx(f, &sz);
-    if (sz.QuadPart <= 0 || sz.QuadPart > (16 << 20))
-    {
-        Log("dict: bad size %lld", sz.QuadPart);
-        CloseHandle(f);
-        return 0;
-    }
-    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, (SIZE_T)sz.QuadPart,
-                                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    DWORD rd = 0;
-    BOOL ok = ReadFile(f, buf, (DWORD)sz.QuadPart, &rd, nullptr);
-    CloseHandle(f);
-    if (!ok || rd != (DWORD)sz.QuadPart) { Log("dict: read failed"); return 0; }
-    Log("dict: %ls (%u bytes)", btxt, rd);
-
-    // 2. 初始化
+    // 1. 初始化（先建 arena/桶, LoadDictDir 直接入表）
     CrcInit();
     g_arena = static_cast<uint8_t*>(VirtualAlloc(nullptr, ARENA_BYTES,
                                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
@@ -1405,16 +1567,24 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     }
     g_dictMask = DICT_BUCKETS - 1;
 
-    if (!LoadBext(buf, rd))
+    // 2. 词典（scripts\<dict_dir>\*.txt, le_strings 格式）
+    uint32_t files = 0, loaded = 0, hashKeys = 0, cjkEntries = 0;
+    if (!LoadDictDir(dictDir, &files, &loaded, &hashKeys, &cjkEntries))
     {
         Log("dict: load failed, idle mode (no hooks)");
         return 0;
     }
-    VirtualFree(buf, 0, MEM_RELEASE);
 
-    // 3. DumpText
-    _wfopen_s(&g_dumpFile, dtxt, L"ab");
-    Log("dump: %ls %s", dtxt, g_dumpFile ? "opened (append)" : "open failed");
+    // 3. DumpText（ini 可关）
+    if (g_cfg.dumpEnabled)
+    {
+        _wfopen_s(&g_dumpFile, dtxt, L"ab");
+        Log("dump: %ls %s", dtxt, g_dumpFile ? "opened (append)" : "open failed");
+    }
+    else
+    {
+        Log("dump: disabled by ini");
+    }
 
     // 4. 引擎指针
     g_fontTabPtr   = VA<void***>(VA_FONTTAB);
@@ -1445,8 +1615,8 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     CloseHandle(CreateThread(nullptr, 0, FontFileThread, hSelf, 0, nullptr));
 
     CloseHandle(CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr));
-    Log("v6 active: dict=%u keys, hooks A=%d B=%d C=%d D=%d E=%d, idling",
-        g_dictCount, (int)a, (int)b, (int)c, (int)d, (int)e);
+    Log("v7 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d, idling",
+        g_dictCount, files, (int)a, (int)b, (int)c, (int)d, (int)e);
     return 0;
 }
 
