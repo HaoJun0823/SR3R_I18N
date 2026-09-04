@@ -1024,7 +1024,16 @@ static bool FinishFont(FakeFont* f)
     memcpy(xt,  offXtab, (size_t)offCount * 4);
     memcpy(yt,  offYtab, (size_t)offCount * 4);
 
-    // 中文字符区（容量截断后的字符）; 超容量槽位 = 预留空白 cell（透明, 不遮挡）
+    // 1) 漏填槽位先填默认兜底（含超容量字符）: 空白 cell, 无 kern
+    //    （必须先于中文字符区填充, 否则会把中文槽位的真实 UV/kernStart 覆盖掉）
+    for (uint32_t slot = (uint32_t)offCount; slot < FAKE_GLYPHS; ++slot)
+    {
+        *(int32_t*)(met + (size_t)slot * 16 + 0)  = f->cellW;
+        *(int32_t*)(met + (size_t)slot * 16 + 4)  = f->cellW;
+        *(int16_t*)(met + (size_t)slot * 16 + 12) = -1;                  // 无 kern（防 kern 表空指针崩溃）
+        *(uint32_t*)(yt + (size_t)slot * 4) = f->blankY;                 // 指向预留空白行（透明, 不遮挡）
+    }
+    // 2) 中文字符区后填, 覆盖默认兜底值（容量截断后的字符）
     for (uint32_t i = 0; i < f->nCells; ++i)
     {
         uint32_t cp = f->cps[i];
@@ -1035,14 +1044,6 @@ static bool FinishFont(FakeFont* f)
         *(int16_t*)(met + (size_t)slot * 16 + 12) = -1;                  // 无 kern
         *(uint32_t*)(xt + (size_t)slot * 4) = (i % perRow) * f->cellW;
         *(uint32_t*)(yt + (size_t)slot * 4) = offH + (i / perRow) * f->cellH;
-    }
-    for (uint32_t slot = (uint32_t)offCount; slot < FAKE_GLYPHS; ++slot)   // 漏填的槽位（含超容量字符）
-    {
-        // yt 已随 memset 为 0; 指向预留空白行, 避免渲染到图集顶部
-        *(int32_t*)(met + (size_t)slot * 16 + 0)  = f->cellW;
-        *(int32_t*)(met + (size_t)slot * 16 + 4)  = f->cellW;
-        *(int16_t*)(met + (size_t)slot * 16 + 12) = -1;                  // 无 kern（防 kern 表空指针崩溃）
-        *(uint32_t*)(yt + (size_t)slot * 4) = f->blankY;
     }
 
     f->obj = obj;
