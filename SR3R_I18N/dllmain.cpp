@@ -704,6 +704,16 @@ static bool FinishFont(FakeFont* f)
 }
 
 // ---------- 请求升级字体（渲染线程, DrawWide 内调用） ----------
+// 文本是否需要中文字形（词典字符集位图: 含任一 >=0x80 字符即需要）
+static bool TextNeedsGlyphs(const wchar_t* s)
+{
+    if (!g_stbReady || !g_dictReady) return false;
+    for (const wchar_t* p = s; *p; ++p)
+        if (*p >= 0x80 && (g_charSet[(uint32_t)*p >> 3] & (1u << (*p & 7))))
+            return true;
+    return false;
+}
+
 // slot: fontTab 槽位号（已规范化, 非 DrawWide 原始 fontId）
 static void RequestFont(uint32_t slot)
 {
@@ -731,26 +741,43 @@ static uint32_t ResolveSlot(void* off)
 }
 
 // DrawWide 命中含中文译文时调用: 规范化 fontId（-1/负组编码/槽位）-> 槽位 -> 触发/推进
+// rawFontId -> FakeFont* 缓存（避免每帧线性扫 fontTab; DrawWide 端高频调用）
+struct FontIdCache { unsigned int raw; FakeFont* f; };
+static FontIdCache g_fidCache[16];
+static volatile LONG g_fidCacheN = 0;
+
 static void EnsureFontFor(unsigned int rawFontId)
 {
     if (!g_stbReady || !g_dictReady) return;
-    void* off = g_origFontLookup((int)rawFontId);
-    if (!off) return;
-    // 已跟踪的字体直接推进（避免每帧线性扫 fontTab）
-    for (uint32_t i = 0; i < FAKE_FONT_MAX; ++i)
+
+    // 已缓存: 直接推进挂起的 D3D 阶段
+    LONG n = g_fidCacheN;
+    if (n > 16) n = 16;
+    for (LONG i = 0; i < n; ++i)
     {
-        FakeFont* f = &g_fake[i];
-        if (f->state != 0 && f->official == off)
+        if (g_fidCache[i].raw == rawFontId)
         {
-            if (f->state == 3) FinishFont(f);   // 光栅化完, 渲染线程做 D3D 阶段
+            if (g_fidCache[i].f->state == 3) FinishFont(g_fidCache[i].f);
             return;
         }
     }
-    // 新字体: 反查槽位号后触发
+
+    // 新 fontId: 解析官方对象 -> 反查槽位
+    void* off = g_origFontLookup((int)rawFontId);
+    if (!off) return;
     uint32_t slot = ResolveSlot(off);
-    if (slot == 0xFFFFFFFFu) return;
+    if (slot >= FAKE_FONT_MAX) return;
     FakeFont* f = &g_fake[slot];
-    if (f->state == 0) RequestFont(slot);
+
+    LONG idx = InterlockedIncrement(&g_fidCacheN) - 1;   // 1 起
+    if (idx < 16)
+    {
+        g_fidCache[idx].raw = rawFontId;
+        g_fidCache[idx].f   = f;
+    }
+
+    if (f->state == 3)      FinishFont(f);       // 光栅化完, 渲染线程做 D3D 阶段
+    else if (f->state == 0) RequestFont(slot);   // 首次: 起后台光栅化
 }
 
 // ---------- 字体初始化线程: 读 TTF + stbtt_InitFont ----------
@@ -836,12 +863,9 @@ static __int64 __fastcall HookDrawWide(void* a1, float x, float y, const wchar_t
     if (text && *text)
     {
         const DictNode* r = LookupNode(text, &g_hitA, &g_missA);
-        if (r)
-        {
-            text = r->trans;
-            if (r->hasCjk)
-                EnsureFontFor(fontId);   // 规范化 -1/负组编码/槽位后触发
-        }
+        if (r) text = r->trans;
+        // 文本含中文字符（无论替换来自 Hook A 还是 Hook B）-> 确保该字体已升级
+        if (TextNeedsGlyphs(text)) EnsureFontFor(fontId);
     }
     return g_origDrawWide(a1, x, y, text, scale, flag, fontId, a8);
 }
@@ -930,8 +954,8 @@ static DWORD WINAPI StatsThread(LPVOID)
     for (;;)
     {
         Sleep(STATS_PERIOD_MS);
-        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | dumped=%u",
-            g_hitA, g_missA, g_hitB, g_missB, g_dumpCount);
+        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | dumped=%u | fonts=%ld",
+            g_hitA, g_missA, g_hitB, g_missB, g_dumpCount, g_fidCacheN);
     }
 }
 
