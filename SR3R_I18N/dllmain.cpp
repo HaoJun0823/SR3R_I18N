@@ -358,8 +358,9 @@ static void DumpText(const wchar_t* s, size_t len)
                     int w = u + 1;
                     utf8[w++] = '"';
                     utf8[w++] = '\n';
+                    // 只写不刷: 逐条 fflush 同步磁盘 I/O 会卡渲染线程（切界面时新 miss 集中涌入）,
+                    // 改由 StatsThread 周期 fflush + 进程退出 fclose 落盘（崩溃最多丢 STATS_PERIOD_MS 内的收集）
                     fwrite(utf8, 1, w, g_dumpFile);
-                    fflush(g_dumpFile);
                 }
             }
         }
@@ -1509,6 +1510,13 @@ static DWORD WINAPI StatsThread(LPVOID)
         Sleep(STATS_PERIOD_MS);
         Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | dumped=%u | fonts=%ld",
             g_hitA, g_missA, g_hitB, g_missB, g_dumpCount, g_fidCacheN);
+        // 周期落盘 dump 收集（替代逐条 fflush, 防切界面卡顿; 崩溃最多丢本轮周期数据）
+        if (g_dumpFile)
+        {
+            AcquireSRWLockExclusive(&g_dumpLock);
+            fflush(g_dumpFile);
+            ReleaseSRWLockExclusive(&g_dumpLock);
+        }
     }
 }
 
@@ -1578,8 +1586,9 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     // 3. DumpText（ini 可关）
     if (g_cfg.dumpEnabled)
     {
-        _wfopen_s(&g_dumpFile, dtxt, L"ab");
-        Log("dump: %ls %s", dtxt, g_dumpFile ? "opened (append)" : "open failed");
+    _wfopen_s(&g_dumpFile, dtxt, L"ab");
+    if (g_dumpFile) setvbuf(g_dumpFile, nullptr, _IOFBF, 1 << 20);   // 1MB 全缓冲: 避免 CRT 小块直写
+    Log("dump: %ls %s", dtxt, g_dumpFile ? "opened (append)" : "open failed");
     }
     else
     {
