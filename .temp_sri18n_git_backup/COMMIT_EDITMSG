@@ -1,0 +1,10 @@
+v5: 3DM 式运行时文本替换（BEXT 词典 + DrawWide/Format 双 detour + DumpText）
+
+- BEXT 词典加载: scripts\text.btxt (5220 条, UTF-8→UTF-16, CRC32 含 NUL 开链哈希 + trim 键双索引)
+- Hook A: sub_1408B5FF0 宽字符绘制入口, R9 文本指针替换 (安全: 超范围字符走 fallback 不越界)
+- Hook B: sub_140812610 formatter 入口, RDX 格式串替换 (保留 {N}/%S 插值语义)
+- DumpText.dtxt: 未命中英文文本去重收集 (SRWLOCK + CRC 去重, 过滤 CJK)
+- 防更新错位: 两个 hook 点入口 16B 特征校验, 不匹配则拒绝安装
+- vcxproj: v142→v141 (MinHook nuget Copy 规则仅支持到 v141), stdcpp20→17,
+  SDK 10.0→10.0.19041.0, 关闭 LTCG (2017 年 MinHook 库与 /GL 不兼容 C1047)
+- 词典生成器 build_btxt.py 修复引号转义 bug (值外层引号未剥导致全表污染)
