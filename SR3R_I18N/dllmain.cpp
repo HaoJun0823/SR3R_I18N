@@ -366,6 +366,9 @@ static FontLookup_t g_origFontLookup = nullptr;
 static TexObj_t     g_origTexObj     = nullptr;
 static SrvResolve_t g_origSrvResolve = nullptr;
 
+// 官方对象 -> fontTab 槽位号（找不到返回 0xFFFFFFFF）
+static uint32_t ResolveSlot(void* off);
+
 // ---------- Hook C: 字体对象查询 ----------
 static void* __fastcall HookFontLookup(int fontId)
 {
