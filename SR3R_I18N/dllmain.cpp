@@ -368,25 +368,55 @@ static SrvResolve_t g_origSrvResolve = nullptr;
 
 // 官方对象 -> fontTab 槽位号（找不到返回 0xFFFFFFFF）
 static uint32_t ResolveSlot(void* off);
+static bool     FinishFont(FakeFont* f);
+static void     RequestFont(uint32_t slot);
 
-// ---------- Hook C: 字体对象查询 ----------
+// ---------- Hook C: 字体对象查询（两渲染器公共必经点） ----------
+// 触发升级 + 伪对象替换
+// ptr 缓存（官方对象 -> FakeFont）, 高频路径避免线性扫 fontTab
+struct PtrCache { void* off; FakeFont* f; };
+static PtrCache     g_ptrCache[16];
+static volatile LONG g_ptrCacheN = 0;
+
+static void EnsureFontReady(void* off)
+{
+    LONG n = g_ptrCacheN; if (n > 16) n = 16;
+    for (LONG i = 0; i < n; ++i)
+    {
+        if (g_ptrCache[i].off != off) continue;
+        FakeFont* f = g_ptrCache[i].f;
+        if (f->state == 3) FinishFont(f);   // 光栅化完 -> D3D 阶段（设备线程安全 flags=0）
+        return;
+    }
+    uint32_t slot = ResolveSlot(off);
+    if (slot >= FAKE_FONT_MAX) return;
+    FakeFont* f = &g_fake[slot];
+    LONG idx = InterlockedIncrement(&g_ptrCacheN) - 1;
+    if (idx < 16) { g_ptrCache[idx].off = off; g_ptrCache[idx].f = f; }
+    if (f->state == 3)      FinishFont(f);
+    else if (f->state == 0) RequestFont(slot);
+}
+
 static void* __fastcall HookFontLookup(int fontId)
 {
     void* off = g_origFontLookup(fontId);
-    if (off)
+    if (!off) return off;
+
+    // 触发/推进升级（菜单文本走 sub_14016E7D0 渲染器, 不经 DrawWide,
+    // 故在此公共必经点触发; 英文渲染不受影响, 官方 cell 照抄）
+    if (g_stbReady && g_dictReady) EnsureFontReady(off);
+
+    // 已 live 的伪对象替换（校验官方对象仍在槽位）
+    uint32_t slot = (fontId >= 0 && (uint32_t)fontId < FAKE_FONT_MAX)
+                    ? (uint32_t)fontId : ResolveSlot(off);
+    if (slot < FAKE_FONT_MAX)
     {
-        uint32_t slot = (fontId >= 0) ? (uint32_t)fontId : ResolveSlot(off);
-        if (slot < FAKE_FONT_MAX)
+        FakeFont* f = &g_fake[slot];
+        if (f->state == 2)
         {
-            FakeFont* f = &g_fake[slot];
-            if (f->state == 2)
-            {
-                // 校验官方对象仍在槽位（引擎重建字体则回退官方, 防悬空）
-                void* cur = (*g_fontTabPtr)[slot];
-                if (cur == f->official) return f->obj;
-                f->state = 4;
-                return cur;
-            }
+            void* cur = (*g_fontTabPtr)[slot];
+            if (cur == f->official) return f->obj;
+            f->state = 4;   // 引擎重建了字体, 回退官方
         }
     }
     return off;
