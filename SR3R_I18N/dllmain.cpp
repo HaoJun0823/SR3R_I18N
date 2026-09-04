@@ -464,7 +464,7 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     int      offCount  = *(int*)( (uint8_t*)off + 8);
     int      offBase   = *(int*)( (uint8_t*)off + 12);
     uint16_t cellH     = *(uint16_t*)((uint8_t*)off + 22);
-    if (offCount <= 0 || offCount >= 0x10000 || cellH < 8 || cellH > 128)
+    if (offCount <= 0 || offCount >= 0x10000 || cellH < 8 || cellH > 256)
     {
         Log("font%u: bad header count=%d cellH=%u, abort", fontId, offCount, cellH);
         f->state = 4; return 0;
