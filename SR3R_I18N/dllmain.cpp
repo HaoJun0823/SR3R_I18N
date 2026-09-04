@@ -462,17 +462,14 @@ static void EnsureFontReady(void* off)
     for (LONG i = 0; i < n; ++i)
     {
         if (g_ptrCache[i].off != off) continue;
-        FakeFont* f = g_ptrCache[i].f;
-        if (f->state == 3) FinishFont(f);   // 光栅化完 -> D3D 阶段（设备线程安全 flags=0）
-        return;
+        return;   // D3D 阶段已移至后台线程, 渲染线程只读 state 不推进（防卡顿）
     }
     uint32_t slot = ResolveSlot(off);
     if (slot >= FAKE_FONT_MAX) return;
     FakeFont* f = &g_fake[slot];
     LONG idx = InterlockedIncrement(&g_ptrCacheN) - 1;
     if (idx < 16) { g_ptrCache[idx].off = off; g_ptrCache[idx].f = f; }
-    if (f->state == 3)      FinishFont(f);
-    else if (f->state == 0) RequestFont(slot);
+    if (f->state == 0) RequestFont(slot);
 }
 
 static void* __fastcall HookFontLookup(int fontId)
@@ -641,7 +638,19 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
     Log("font%u: rasterized %u cells (cellW=%u cellH=%u baseline=%d, missGlyph=%u, official count=%d)",
         fontId, n, cellW, cellH, baseline, missGlyph, offCount);
 
-    InterlockedExchange(&f->state, 3);  // 待渲染线程 D3D 阶段
+    InterlockedExchange(&f->state, 3);  // 待 D3D 阶段
+
+    // D3D 阶段也在本后台线程完成（FinishFont 内 CAS 3->5 防并发）:
+    // 原设计在渲染线程做, 官方图集读回+大纹理上传会卡主界面首帧; 后台做完后伪对象才 live,
+    // 未就绪期间引擎用官方字体渲染中文 -> 槽码越界被 sub_140858C10 边界检查挡住 -> 安全空白回退
+    // 暂时性失败（D3D/官方SRV未就绪, state 回 3）: 后台重试至多 30s
+    for (int retry = 0; retry < 300; ++retry)
+    {
+        if (FinishFont(f)) return 0;
+        if (f->state != 3) return 0;   // 永久失败(4)/已被别的线程完成, 不再重试
+        Sleep(100);
+    }
+    Log("font%u: D3D stage gave up after 30s (state=%ld)", fontId, f->state);
     return 0;
 }
 
@@ -1195,16 +1204,12 @@ static void EnsureFontFor(unsigned int rawFontId)
 {
     if (!g_stbReady || !g_dictReady) return;
 
-    // 已缓存: 直接推进挂起的 D3D 阶段
+    // 已缓存: D3D 阶段由后台线程推进, 此处不再调 FinishFont（渲染线程防卡顿）
     LONG n = g_fidCacheN;
     if (n > 16) n = 16;
     for (LONG i = 0; i < n; ++i)
     {
-        if (g_fidCache[i].raw == rawFontId)
-        {
-            if (g_fidCache[i].f->state == 3) FinishFont(g_fidCache[i].f);
-            return;
-        }
+        if (g_fidCache[i].raw == rawFontId) return;
     }
 
     // 新 fontId: 解析官方对象 -> 反查槽位
@@ -1221,8 +1226,7 @@ static void EnsureFontFor(unsigned int rawFontId)
         g_fidCache[idx].f   = f;
     }
 
-    if (f->state == 3)      FinishFont(f);       // 光栅化完, 渲染线程做 D3D 阶段
-    else if (f->state == 0) RequestFont(slot);   // 首次: 起后台光栅化
+    if (f->state == 0) RequestFont(slot);   // 首次: 起后台光栅化
 }
 
 // ---------- 字体初始化线程: 读 TTF + stbtt_InitFont ----------
