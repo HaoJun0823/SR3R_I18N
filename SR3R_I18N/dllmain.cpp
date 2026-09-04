@@ -836,12 +836,23 @@ static bool FinishFont(FakeFont* f)
     srcTex->GetDesc(&dd);
 
     uint32_t W = dd.Width;
+    uint32_t offW = W;               // 官方图集宽（读回官方区按此宽; 加宽后官方区只占伪图集左侧）
     uint32_t offH = dd.Height;
     uint32_t perRow = W / f->cellW;
     if (perRow == 0) { Log("font%u: atlas width %u < cellW %u, abort", fontId, W, f->cellW); srcTex->Release(); f->state = 4; return false; }
     uint32_t nCellsWanted = f->nCells;   // 截断前记录（日志用）
     uint32_t rows = (f->nCells + perRow - 1) / perRow;
     uint32_t maxRows = (16384 - offH) / f->cellH - 1;   // 末尾恒留 1 行空白 cell（缺字槽位指向这里）
+    if (rows > maxRows && W < 8192)
+    {
+        // 显存换全字覆盖: 加宽伪图集减少截断（BGRA8 8192 宽约 500MB, 现代 8G 卡无压力）
+        uint32_t oldW = W;
+        W = 8192;
+        perRow = W / f->cellW;
+        rows = (f->nCells + perRow - 1) / perRow;
+        maxRows = (16384 - offH) / f->cellH - 1;
+        Log("font%u: atlas widened %u -> %u (perRow %u -> %u)", fontId, oldW, W, oldW / f->cellW, perRow);
+    }
     if (rows > maxRows)
     {
         rows = maxRows;
@@ -882,10 +893,10 @@ static bool FinishFont(FakeFont* f)
         return false;
     }
 
-    // 格式信息前置记录（拷贝循环前, 崩溃也能拿到）
-    Log("font%u: atlas %ux%u fmt=%s(%u) mips=%u arr=%u RowPitch=%u (dd.pitch=%u)",
-        fontId, W, offH, FmtName(dd.Format), (unsigned)dd.Format,
-        dd.MipLevels, dd.ArraySize, ms.RowPitch, W * 4);
+    // 格式信息前置记录（拷贝循环前, 崩溃也能拿到; 宽高指官方源图集）
+    Log("font%u: src atlas %ux%u fmt=%s(%u) mips=%u arr=%u RowPitch=%u",
+        fontId, offW, offH, FmtName(dd.Format), (unsigned)dd.Format,
+        dd.MipLevels, dd.ArraySize, ms.RowPitch);
 
     // 格式感知读回 -> atlas 统一为 BGRA8
     bool     bc  = IsBcFormat(dd.Format);
@@ -906,13 +917,13 @@ static bool FinishFont(FakeFont* f)
         uint32_t blocksY = (offH + 3) >> 2;
         for (uint32_t by = 0; by < blocksY; ++by)
             DecodeBcStrip(dd.Format, (const uint8_t*)ms.pData, ms.RowPitch,
-                          by, W, offH, atlas, pitch);
+                          by, offW, offH, atlas, pitch);   // 源宽 offW, 写入加宽后的 pitch
     }
     else if (bpp == 4)
     {
         for (uint32_t row = 0; row < offH; ++row)
             memcpy(atlas + (SIZE_T)row * pitch,
-                   (const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch, (SIZE_T)W * 4);
+                   (const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch, (SIZE_T)offW * 4);
     }
     else if (bpp == 2)
     {
@@ -920,7 +931,7 @@ static bool FinishFont(FakeFont* f)
         {
             const uint16_t* s = (const uint16_t*)((const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch);
             uint32_t* d = (uint32_t*)(atlas + (SIZE_T)row * pitch);
-            for (uint32_t x = 0; x < W; ++x)
+            for (uint32_t x = 0; x < offW; ++x)
             {
                 uint16_t v = s[x];
                 uint8_t r = (uint8_t)(((v >> 11) & 0x1F) * 255 / 31);
@@ -939,7 +950,7 @@ static bool FinishFont(FakeFont* f)
         {
             const uint8_t* s = (const uint8_t*)ms.pData + (SIZE_T)row * ms.RowPitch;
             uint32_t* d = (uint32_t*)(atlas + (SIZE_T)row * pitch);
-            for (uint32_t x = 0; x < W; ++x)
+            for (uint32_t x = 0; x < offW; ++x)
             {
                 uint32_t c = s[x];
                 d[x] = (c << 24) | (c << 16) | (c << 8) | c;
@@ -953,7 +964,7 @@ static bool FinishFont(FakeFont* f)
     {
         uint32_t sx = *(uint32_t*)((uint8_t*)offXtab + 4 * ('W' - 0x20));
         uint32_t sy = *(uint32_t*)((uint8_t*)offYtab + 4 * ('W' - 0x20));
-        if (sx + 8 < W && sy + 8 < offH)
+        if (sx + 8 < offW && sy + 8 < offH)
         {
             uint32_t* px = (uint32_t*)(atlas + (SIZE_T)sy * pitch + (SIZE_T)sx * 4);
             Log("font%u: sample W@(%u,%u): %08X %08X %08X %08X",
