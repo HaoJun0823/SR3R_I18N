@@ -1041,6 +1041,7 @@ static bool FinishFont(FakeFont* f)
         // yt 已随 memset 为 0; 指向预留空白行, 避免渲染到图集顶部
         *(int32_t*)(met + (size_t)slot * 16 + 0)  = f->cellW;
         *(int32_t*)(met + (size_t)slot * 16 + 4)  = f->cellW;
+        *(int16_t*)(met + (size_t)slot * 16 + 12) = -1;                  // 无 kern（防 kern 表空指针崩溃）
         *(uint32_t*)(yt + (size_t)slot * 4) = f->blankY;
     }
 
@@ -1447,7 +1448,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         LogOpen(hModule);
         if (g_log)
         {
-			Log("[Info] SR3R Character Extend By Randerion(HaoJun0823) https://www.haojun0823.xyz | https://github.com/HaoJun0823/SR3R_I18N");
+			Log("[Info] SR3R Font Extend By HaoJun0823 https://www.haojun0823.xyz | https://github.com/HaoJun0823/SR3R_I18N");
             Log("[DllMain] ATTACH v6");
             CloseHandle(CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr));
         }
