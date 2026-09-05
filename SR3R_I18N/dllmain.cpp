@@ -77,6 +77,7 @@ static constexpr uint32_t FONT_BASECHAR_DEFAULT = 0x20u;
 
 static constexpr size_t ARENA_BYTES   = 128u << 20;   // 词典字符串区（几万条译文上限安全值）
 static constexpr uint32_t DICT_BUCKETS = 1u << 15;
+static constexpr uint32_t ORIG_BUCKETS = 1u << 14;   // origin 联表 16384 桶（1 万+ ID 键）
 static constexpr uint32_t DUMP_BUCKETS = 1u << 12;
 static constexpr size_t DUMP_MAX_CHARS = 256;
 static constexpr DWORD  STATS_PERIOD_MS = 30000;
@@ -123,12 +124,14 @@ static void Log(const char* fmt, ...)
 struct Config
 {
     wchar_t dictDir[MAX_PATH];    // 词典文件夹（相对 asi 目录）
+    wchar_t originDir[MAX_PATH];  // 联表文件夹（ID/HASH_ -> 英文原文; 相对 asi 目录）
     wchar_t fontFile[MAX_PATH];   // 字体 TTF 文件名（相对 asi 目录）
     bool     dumpEnabled;         // 未命中文本收集（DumpText.dtxt）
 };
 
 static Config g_cfg = {
     L"dict",                       // 默认: scripts/dict/
+    L"origin",                     // 默认: scripts/origin/
     L"SourceHanSansHWSC-VF.ttf",   // 默认字体
     true,
 };
@@ -180,14 +183,15 @@ static void LoadConfig(const wchar_t* iniPath)
         while (ve > val && (ve[-1] == L' ' || ve[-1] == L'\t')) *--ve = L'\0';
 
         if (_wcsicmp(key, L"dict_dir") == 0)         wcscpy_s(g_cfg.dictDir, val);
+        else if (_wcsicmp(key, L"origin_dir") == 0)  wcscpy_s(g_cfg.originDir, val);
         else if (_wcsicmp(key, L"font_file") == 0)   wcscpy_s(g_cfg.fontFile, val);
         else if (_wcsicmp(key, L"dump_enabled") == 0) g_cfg.dumpEnabled = (*val != L'0');
 
         line = wcstok_s(nullptr, L"\r\n", &ctx);
     }
     VirtualFree(wbuf, 0, MEM_RELEASE);
-    Log("cfg: %ls loaded (dict_dir=%ls font_file=%ls dump=%d)",
-        iniPath, g_cfg.dictDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled);
+    Log("cfg: %ls loaded (dict_dir=%ls origin_dir=%ls font_file=%ls dump=%d)",
+        iniPath, g_cfg.dictDir, g_cfg.originDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled);
 }
 
 // ---------- CRC-32 (IEEE 反射, 与 zlib.crc32 一致) ----------
@@ -293,6 +297,57 @@ static const DictNode* DictLookup(const wchar_t* s, size_t len)
     uint32_t crc = CrcText(s, len);
     for (DictNode* n = g_dictBuckets[crc & g_dictMask]; n; n = n->next)
         if (n->crc == crc && n->len == len && wmemcmp(n->orig, s, len) == 0)
+            return n;
+    return nullptr;
+}
+
+// ---------- origin 联表（消息 ID/HASH_ -> 英文原文; 加载后只读无锁, 与词典同型） ----------
+// scripts\origin\*.txt: "消息ID或HASH_xxx": "英文明文"
+// 引擎运行时绘制的是解析后的英文明文（DumpText 实证）, 消息 ID 不会到达 hook 层;
+// 词典键为消息 ID 时经此表消解为英文原文再入主表。
+struct OrigNode
+{
+    uint32_t      crc;      // 键（消息 ID/HASH_）CRC
+    uint32_t      len;      // 英文原文长度（不含 NUL）
+    const wchar_t* key;     // 键（碰撞校验）
+    const wchar_t* val;     // 英文原文
+    OrigNode*     next;
+};
+
+static OrigNode** g_origBuckets = nullptr;
+static uint32_t   g_origMask    = 0;
+static uint32_t   g_origCount   = 0;
+
+static bool OrigInsert(const wchar_t* key, uint32_t keyLen, const wchar_t* val, uint32_t valLen)
+{
+    auto* node = static_cast<OrigNode*>(ArenaAlloc(sizeof(OrigNode)));
+    if (!node) return false;
+    auto* keyCopy = static_cast<wchar_t*>(ArenaAlloc((keyLen + 1) * sizeof(wchar_t)));
+    if (!keyCopy) return false;
+    auto* valCopy = static_cast<wchar_t*>(ArenaAlloc((valLen + 1) * sizeof(wchar_t)));
+    if (!valCopy) return false;
+    memcpy(keyCopy, key, keyLen * sizeof(wchar_t));
+    keyCopy[keyLen] = L'\0';
+    memcpy(valCopy, val, valLen * sizeof(wchar_t));
+    valCopy[valLen] = L'\0';
+
+    node->crc  = CrcText(keyCopy, keyLen);
+    node->len  = valLen;
+    node->key  = keyCopy;
+    node->val  = valCopy;
+    uint32_t h = node->crc & g_origMask;
+    node->next = g_origBuckets[h];
+    g_origBuckets[h] = node;
+    ++g_origCount;
+    return true;
+}
+
+static const OrigNode* OrigLookup(const wchar_t* s, size_t len)
+{
+    if (!g_origBuckets) return nullptr;
+    uint32_t crc = CrcText(s, len);
+    for (OrigNode* n = g_origBuckets[crc & g_origMask]; n; n = n->next)
+        if (n->crc == crc && n->len == len && wmemcmp(n->key, s, len) == 0)
             return n;
     return nullptr;
 }
@@ -925,11 +980,13 @@ static bool FinishFont(FakeFont* f)
     uint32_t nCellsWanted = f->nCells;   // 截断前记录（日志用）
     uint32_t rows = (f->nCells + perRow - 1) / perRow;
     uint32_t maxRows = (16384 - offH) / f->cellH - 1;   // 末尾恒留 1 行空白 cell（缺字槽位指向这里）
-    if (rows > maxRows && W < 8192)
+    if (rows > maxRows && W < 16384)
     {
-        // 显存换全字覆盖: 加宽伪图集减少截断（BGRA8 8192 宽约 500MB, 现代 8G 卡无压力）
+        // 显存换全字覆盖: 加宽伪图集减少截断
+        // （font1 官方 4096 宽仅 18 列; 8192 宽 37 列仍不够 2656 字, 16384 宽 74 列上限 4736 字;
+        //   BGRA8 16384 宽满高上限约 1GB, 实际 font1 约 670MB, 现代 8G 显卡无压力）
         uint32_t oldW = W;
-        W = 8192;
+        W = 16384;
         perRow = W / f->cellW;
         rows = (f->nCells + perRow - 1) / perRow;
         maxRows = (16384 - offH) / f->cellH - 1;
@@ -1366,7 +1423,7 @@ static bool ParseLeLine(wchar_t* line, LeLine* out)
     ++p;
     wchar_t* val = p;
 
-    // 值反转义（\\ \" \n）, 原地写
+    // 值反转义（\\ \" \n \r）, 原地写（sr3le_extract.py 输出含 \r 转义, 不处理会混入字母 r）
     wchar_t* w = p;
     while (*p)
     {
@@ -1374,6 +1431,7 @@ static bool ParseLeLine(wchar_t* line, LeLine* out)
         {
             ++p;
             if      (*p == L'n')  *w++ = L'\n';
+            else if (*p == L'r')  *w++ = L'\r';
             else if (*p == L'\\') *w++ = L'\\';
             else if (*p == L'"')  *w++ = L'"';
             else if (*p)          *w++ = *p;   // 未知转义按原样
@@ -1392,13 +1450,106 @@ static bool ParseLeLine(wchar_t* line, LeLine* out)
     return false;   // 未闭合
 }
 
-// 处理一条 key/val: HASH_ 键跳过; 过滤无意义条目; 入表
+// 加载一个 origin txt（UTF-8, 带/不带 BOM; CRLF/LF; 格式: "消息ID": "英文原文"）
+// 结果入 origin 表; 不收集字符集; HASH_ 键同样入表（联表后无法消解时才在 AddDictEntry 跳过）
+static bool LoadOriginFile(const wchar_t* path)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (32 << 20))
+    { Log("origin: %ls bad size %lld", path, sz.QuadPart); CloseHandle(f); return false; }
+
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, (SIZE_T)sz.QuadPart,
+                                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    DWORD rd = 0;
+    BOOL ok = buf && ReadFile(f, buf, (DWORD)sz.QuadPart, &rd, nullptr);
+    CloseHandle(f);
+    if (!ok || rd != (DWORD)sz.QuadPart)
+    { if (buf) VirtualFree(buf, 0, MEM_RELEASE); return false; }
+
+    int utf8Off = (rd >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off,
+                                   (int)(rd - utf8Off), nullptr, 0);
+    if (wlen <= 0)
+    { Log("origin: %ls not valid UTF-8", path); VirtualFree(buf, 0, MEM_RELEASE); return false; }
+    auto* wbuf = static_cast<wchar_t*>(VirtualAlloc(nullptr, (wlen + 2) * sizeof(wchar_t),
+                                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!wbuf) { VirtualFree(buf, 0, MEM_RELEASE); return false; }
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off, (int)(rd - utf8Off), wbuf, wlen);
+    wbuf[wlen] = L'\0';
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    uint32_t entries = 0;
+    wchar_t* ctx = nullptr;
+    wchar_t* line = wcstok_s(wbuf, L"\r\n", &ctx);
+    while (line)
+    {
+        LeLine le;
+        if (ParseLeLine(line, &le))
+        {
+            size_t kn = wcslen(le.key), vn = wcslen(le.val);
+            if (kn > 0 && kn <= 512 && vn > 0 && vn <= 8192)
+            {
+                if (OrigInsert(le.key, (uint32_t)kn, le.val, (uint32_t)vn)) ++entries;
+            }
+        }
+        line = wcstok_s(nullptr, L"\r\n", &ctx);
+    }
+    VirtualFree(wbuf, 0, MEM_RELEASE);
+    return entries > 0;
+}
+
+// 扫描 origin 文件夹（*.txt; 后加载的同键覆盖前面 = 头插哈希表）
+static bool LoadOriginDir(const wchar_t* dir)
+{
+    wchar_t pat[MAX_PATH];
+    _snwprintf_s(pat, MAX_PATH, _TRUNCATE, L"%ls\\*.txt", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        Log("origin: folder %ls not found (GLE=%lu), ID/HASH_ dict keys will be skipped",
+            dir, GetLastError());
+        return false;
+    }
+    uint32_t files = 0;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, fd.cFileName);
+        if (LoadOriginFile(path)) ++files;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    Log("origin: %u files, %u ids", files, g_origCount);
+    return files > 0;
+}
+
+// 处理一条 key/val: ID/HASH_ 键经 origin 联表转英文原文; 其余按原文键入表
 static void AddDictEntry(const wchar_t* key, const wchar_t* val,
                          uint32_t* loaded, uint32_t* hashKeys, uint32_t* cjkEntries)
 {
     size_t on = wcslen(key), tn = wcslen(val);
     if (on == 0 || tn == 0 || on > 4096 || tn > 4096) return;
-    if (on > 5 && _wcsnicmp(key, L"HASH_", 5) == 0) { ++*hashKeys; return; }  // 槽位名, 不参与运行时查表
+
+    // 键消解: origin 联表（ID/HASH_xxx -> 英文原文）
+    //   - 命中   -> 用英文原文当键（引擎运行时只画解析后的文本, ID 不会到达 hook 层）
+    //   - 未命中 -> 键即原文（"Blonde"类条目两条路线通吃）
+    //   - 未命中且是 HASH_ -> 无法消解的槽位名, 跳过
+    const wchar_t* effKey = key;
+    size_t effLen = on;
+    if (g_origBuckets)
+    {
+        const OrigNode* o = OrigLookup(key, on);
+        if (o && o->len > 0) { effKey = o->val; effLen = o->len; }
+        else if (!o && on > 5 && _wcsnicmp(key, L"HASH_", 5) == 0)
+        { ++*hashKeys; return; }   // origin 里也查不到的 HASH_ 槽位名
+    }
+    else if (on > 5 && _wcsnicmp(key, L"HASH_", 5) == 0)
+    { ++*hashKeys; return; }       // 无 origin 表时维持旧行为
 
     auto* transW = static_cast<wchar_t*>(ArenaAlloc((tn + 1) * sizeof(wchar_t)));
     if (!transW) return;
@@ -1411,14 +1562,14 @@ static void AddDictEntry(const wchar_t* key, const wchar_t* val,
         if (*p >= 0x80) { CharSetAdd(*p); hasCjk = true; }
     if (hasCjk) ++*cjkEntries;
 
-    auto* origW = static_cast<wchar_t*>(ArenaAlloc((on + 1) * sizeof(wchar_t)));
+    auto* origW = static_cast<wchar_t*>(ArenaAlloc((effLen + 1) * sizeof(wchar_t)));
     if (!origW) return;
-    memcpy(origW, key, on * sizeof(wchar_t));
-    origW[on] = L'\0';
+    memcpy(origW, effKey, effLen * sizeof(wchar_t));
+    origW[effLen] = L'\0';
 
-    if (DictInsert(origW, (uint32_t)on, transW)) ++*loaded;
+    if (DictInsert(origW, (uint32_t)effLen, transW)) ++*loaded;
     size_t b, tl;
-    if (TrimRange(origW, (size_t)on, &b, &tl) && !(b == 0 && tl == (size_t)on))
+    if (TrimRange(origW, effLen, &b, &tl) && !(b == 0 && tl == effLen))
     {
         if (DictInsert(origW + b, (uint32_t)tl, transW)) ++*loaded;   // 计入 trim 键
     }
@@ -1572,14 +1723,23 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
                                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     g_dumpBuckets = static_cast<DumpNode**>(VirtualAlloc(nullptr, DUMP_BUCKETS * sizeof(DumpNode*),
                                                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!g_arena || !g_dictBuckets || !g_dumpBuckets)
+    g_origBuckets = static_cast<OrigNode**>(VirtualAlloc(nullptr, ORIG_BUCKETS * sizeof(OrigNode*),
+                                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!g_arena || !g_dictBuckets || !g_dumpBuckets || !g_origBuckets)
     {
         Log("alloc failed, abort");
         return 0;
     }
     g_dictMask = DICT_BUCKETS - 1;
 
-    // 2. 词典（scripts\<dict_dir>\*.txt, le_strings 格式）
+    // 2. origin 联表（消息 ID -> 英文原文; 缺失/失败时退化为旧行为, ID/HASH_ 键跳过）
+    wchar_t originDir[MAX_PATH];
+    _snwprintf_s(originDir, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, g_cfg.originDir);
+    g_origMask = ORIG_BUCKETS - 1;      // 必须先于 LoadOriginDir（OrigInsert 在加载中就要用）
+    if (!LoadOriginDir(originDir))
+        g_origBuckets = nullptr;   // 无 origin: OrigLookup 直接返 null, AddDictEntry 走旧行为
+
+    // 3. 词典（scripts\<dict_dir>\*.txt, le_strings 格式）
     uint32_t files = 0, loaded = 0, hashKeys = 0, cjkEntries = 0;
     if (!LoadDictDir(dictDir, &files, &loaded, &hashKeys, &cjkEntries))
     {
