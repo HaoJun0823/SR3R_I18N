@@ -43,6 +43,7 @@
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
+#include "charset_data.h"
 
 // ---------- 配置 ----------
 static constexpr uint64_t GAME_BASE = 0x140000000ULL;
@@ -1296,7 +1297,7 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
     if (slash) *slash = L'\0'; else *dir = L'\0';
 
     // 等词典就绪（字符集收集完毕）
-    for (int i = 0; i < 300; ++i) { if (g_dictReady) break; Sleep(100); }
+    for (int i = 300; i--; ) { if (g_dictReady) break; Sleep(100); }
     if (!g_dictReady) { Log("font: dict not ready, glyph layer disabled"); return 0; }
 
     // 词典字符集 + 全角标点/符号保险集
@@ -1305,7 +1306,21 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
         L"０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
         L"ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ";
     for (const wchar_t* p = extra; *p; ++p) CharSetAdd(*p);
-    Log("font: charset %u chars (dict) + extras", g_charCount);
+
+    if (g_charCount == 0)
+    {
+        // font-only 模式: 词典目录缺失/为空, 注入内核汉化(F1)固化字符集
+        for (unsigned i = 0; i < kCharsetKernelCount; ++i)
+        {
+            CharSetAdd((wchar_t)kCharsetKernel[i].cp);
+            g_charFreq[kCharsetKernel[i].cp] = kCharsetKernel[i].freq;  // 频率表覆盖(嵌入时未计 extra)
+        }
+        Log("font: charset %u chars (kernel builtin)", g_charCount);
+    }
+    else
+    {
+        Log("font: charset %u chars (dict) + extras", g_charCount);
+    }
 
     // 读 TTF（ini 字体文件名; 兼容旧名 font.ttf）
     wchar_t ttf[MAX_PATH];
@@ -1740,13 +1755,12 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     if (!LoadOriginDir(originDir))
         g_origBuckets = nullptr;   // 无 origin: OrigLookup 直接返 null, AddDictEntry 走旧行为
 
-    // 3. 词典（scripts\<dict_dir>\*.txt, le_strings 格式）
+    // 3. 词典（scripts\<dict_dir>\*.txt, le_strings 格式; 可选——内核汉化(F1)已接管文本,
+    //    词典目录缺失/为空时进 font-only 模式: hooks 照装, 字形层用内置字符集）
     uint32_t files = 0, loaded = 0, hashKeys = 0, cjkEntries = 0;
-    if (!LoadDictDir(dictDir, &files, &loaded, &hashKeys, &cjkEntries))
-    {
-        Log("dict: load failed, idle mode (no hooks)");
-        return 0;
-    }
+    bool dictOk = LoadDictDir(dictDir, &files, &loaded, &hashKeys, &cjkEntries);
+    if (!dictOk)
+        Log("dict: load failed/skipped, font-only mode (kernel text + builtin charset)");
 
     // 3. DumpText（ini 可关）
     if (g_cfg.dumpEnabled)
