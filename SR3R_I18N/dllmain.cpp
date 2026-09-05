@@ -83,6 +83,13 @@ static constexpr uint32_t DUMP_BUCKETS = 1u << 12;
 static constexpr size_t DUMP_MAX_CHARS = 256;
 static constexpr DWORD  STATS_PERIOD_MS = 30000;
 
+// v7.3 字幕折行重组（引擎按字幕框宽度 word-wrap 后逐行查词典, 完整句 key 永远 miss）
+//   段1(前缀行, 末尾无标点) 先 miss -> 缓存; 段2(后缀行) 到来时拼接重查,
+//   命中后按英文长度比例切分译文: 前缀行显示前半, 后缀行显示后半（每帧反复命中, 状态常驻）
+static constexpr size_t   WRAP_MAX_CHARS  = 256;   // 缓存残段/拼接缓冲上限（wchar）
+static constexpr uint64_t WRAP_TTL_MS     = 5000;  // 残段缓存过期（防不同句子串扰）
+static constexpr size_t   WRAP_MIN_PREFIX = 8;     // 前缀残段最短长度（过滤短 UI 串噪音）
+static constexpr size_t   WRAP_MIN_SUFFIX = 2;     // 后缀残段最短长度
 // ---------- VA -> 本进程地址 ----------
 template <typename T = uint8_t*>
 static inline T VA(uint64_t va)
@@ -432,6 +439,7 @@ static void DumpText(const wchar_t* s, size_t len)
 
 // ---------- Hook 共用: 查词典 + miss 统计/dump ----------
 static volatile LONG g_hitA = 0, g_missA = 0, g_hitB = 0, g_missB = 0;
+static volatile LONG g_wrapHits = 0;   // v7.3: 折行重组命中次数
 
 static const DictNode* LookupNode(const wchar_t* s, volatile LONG* hit, volatile LONG* miss)
 {
@@ -457,6 +465,259 @@ static const DictNode* LookupNode(const wchar_t* s, volatile LONG* hit, volatile
 
     InterlockedIncrement(miss);
     DumpText(s, len);
+    return nullptr;
+}
+
+// =====================================================================
+// v7.3 字幕折行重组（引擎 word-wrap 后逐行查词典 → 长句 key miss）
+// =====================================================================
+// 引擎折行行为（DumpText.dtxt 569/570 实测 + word-wrap 常规规则）:
+//   段1(前缀行): 完整句前缀, 折行点前的空格被吞; 段2(后缀行): 头部空格被吞。
+//   两行同帧先后 format, 之后每帧重复, 直到字幕换句。
+//   期间穿插其他 HUD 文本 format（计数器等常量文本）—— 不得据此判定换句。
+// 状态机（仅渲染线程调用, 无锁）:
+//   IDLE  : 学习疑似段1（词典 miss 且以词中字符结尾）
+//   LEARN : 段1 已缓存, 等段2 拼接验证（补空格/不补两种变体查词典）; 同文本重画刷新 TTL
+//   STABLE: 拼接命中后进入。前缀行回译文前半, 后缀行回译文后半（切点按英文折行比例预计算）。
+//           非匹配的长词中文本只作"暂定段1"暂存 —— 仅当它与后续文本拼接命中词典
+//           才替换当前稳定态（防 HUD 常量噪音破坏切分）。
+//
+// WRAP_TTL_MS: LEARN 段1 过期时间; STABLE 无 TTL（靠精确匹配, 新句拼接命中自动接管）。
+
+enum WrapMode { WRAP_IDLE = 0, WRAP_LEARN = 1, WRAP_STABLE = 2 };
+
+struct WrapState
+{
+    int      mode;                          // WrapMode
+    wchar_t  pend[WRAP_MAX_CHARS];          // LEARN=段1; STABLE=暂定新段1（pendLen=0 表示无）
+    size_t   pendLen;
+    uint64_t pendTick;                      // LEARN 段1 最近重画时刻（TTL 用）
+    wchar_t  full[WRAP_MAX_CHARS];          // STABLE: 完整英文原文
+    size_t   fullLen;
+    size_t   preLen;                        // STABLE: 前缀行长度（不含被吞的空格）
+    size_t   sufAt;                         // STABLE: 后缀行在完整句中的起点
+    size_t   cut;                           // STABLE: 译文切点
+    const DictNode* node;                   // STABLE: 命中的词典节点
+};
+
+static WrapState g_wrap;
+
+// STABLE 两行译文（命中时预计算好, 渲染线程直接返回指针）
+static wchar_t g_half1[WRAP_MAX_CHARS + 1];
+static wchar_t g_half2[WRAP_MAX_CHARS + 1];
+
+static uint64_t NowTick()
+{
+    return GetTickCount64();
+}
+
+// 段1 候选: 够长 + 尾字符是词中字符（引擎折行断在词边界, 段1 不会以句读收尾;
+// 数字结尾多为 HUD 计数器, 排除）
+static bool WrapLooksLikePrefix(const wchar_t* s, size_t len)
+{
+    if (len < WRAP_MIN_PREFIX || len >= WRAP_MAX_CHARS) return false;
+    wchar_t last = s[len - 1];
+    return (last >= L'a' && last <= L'z') || (last >= L'A' && last <= L'Z') ||
+           last == L'-' || last == 0x2019 || last == 0x201D ||   // - ' ”
+           last == L'"' || last == L',' || last == L'*';
+}
+
+static bool WrapLooksLikeSuffix(size_t len)
+{
+    return len >= WRAP_MIN_SUFFIX && len < WRAP_MAX_CHARS;
+}
+
+// 拼接 pend + 段2 查词典。命中返回节点, 并把完整句写入 out（含 NUL）,
+// outLen=完整句长度, outSufAt=后缀行在完整句中的起点。
+// 变体1: pend + ' ' + seg（词间折行, 空格被吞）; 变体2: pend + seg（连字符断词/引擎去空格）
+static const DictNode* WrapTryConcat(const wchar_t* pend, size_t plen,
+                                     const wchar_t* s, size_t len,
+                                     wchar_t* out, size_t* outLen, size_t* outSufAt)
+{
+    if (plen + len + 1 >= WRAP_MAX_CHARS) return nullptr;
+    wmemcpy(out, pend, plen);
+    out[plen] = L' ';
+    wmemcpy(out + plen + 1, s, len);
+    out[plen + 1 + len] = L'\0';
+    const DictNode* r = DictLookup(out, plen + 1 + len);
+    if (r) { *outLen = plen + 1 + len; *outSufAt = plen + 1; return r; }
+
+    wmemcpy(out + plen, s, len);
+    out[plen + len] = L'\0';
+    r = DictLookup(out, plen + len);
+    if (r) { *outLen = plen + len; *outSufAt = plen; return r; }
+    return nullptr;
+}
+
+// 切点评分: 越大越好。标点后 > CJK 边界 > 其他; 保证 [2, len-2] 界内
+// （首尾各留 >=2 字符, 避免半截词/孤立标点行）; 同分取离中点最近的切点
+// （译文两行长度更均衡, 避免把大半译文切给第一行）
+static size_t PickSplitIndex(const wchar_t* t, size_t n)
+{
+    if (n < 6) return n / 2;
+    size_t best = n / 2;
+    size_t mid  = n / 2;
+    int    bestSc = -1;
+    for (size_t i = 2; i < n - 2; ++i)
+    {
+        // 优先标点后切: ,。!?;:、· （句读自然断点）
+        int sc = (t[i - 1] >= 0x80 && t[i] >= 0x80) ? 1 : 0;
+        if (wcschr(L",。!?;:、·", t[i - 1])) sc = 2;
+        size_t dI    = (i > mid) ? i - mid : mid - i;
+        size_t dBest = (best > mid) ? best - mid : mid - best;
+        if (sc > bestSc || (sc == bestSc && dI < dBest)) { bestSc = sc; best = i; }
+    }
+    return best;
+}
+
+// 折行重组主流程。HookFormat 的 fmt 每次进来都过这里（仅渲染线程, 无锁）。
+// 返回: nullptr = 按原文本走; 非 null = 替换文本指针（稳定态切分译文）
+static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
+{
+    uint64_t now = NowTick();
+
+    // 暂定段1 过期清理（STABLE/LEARN 共用; 防陈旧 pend 与后续无关文本误拼接）
+    if (g_wrap.pendLen && now - g_wrap.pendTick > WRAP_TTL_MS)
+    {
+        g_wrap.pendLen = 0;
+        if (g_wrap.mode == WRAP_LEARN) g_wrap.mode = WRAP_IDLE;
+    }
+
+    // ---------- STABLE: 持续切分, 直到新句拼接命中接管 ----------
+    if (g_wrap.mode == WRAP_STABLE && g_wrap.node)
+    {
+        bool isPrefix = (len == g_wrap.preLen) &&
+                        wmemcmp(s, g_wrap.full, g_wrap.preLen) == 0;
+        bool isSuffix = (len == g_wrap.fullLen - g_wrap.sufAt) &&
+                        wmemcmp(s, g_wrap.full + g_wrap.sufAt, len) == 0;
+        if (isPrefix) return g_half1;
+        if (isSuffix) return g_half2;
+
+        // 新句的段1: 疑似前缀 -> 只暂存, 不破坏当前稳定态（防 HUD 常量噪音）。
+        if (!g_wrap.pendLen && WrapLooksLikePrefix(s, len))
+        {
+            wmemcpy(g_wrap.pend, s, len);
+            g_wrap.pend[len] = L'\0';
+            g_wrap.pendLen   = len;
+            g_wrap.pendTick  = now;
+            return nullptr;
+        }
+
+        // 暂定段1 已武装: 当前文本疑似新句段2 -> 拼接重查, 命中则新句接管稳定态
+        // （译文长度上界 guard: g_half1/g_half2 定长 256, 超长译文无法安全切分）
+        if (g_wrap.pendLen && WrapLooksLikeSuffix(len))
+        {
+            wchar_t cand[WRAP_MAX_CHARS + 1];
+            size_t  fullLen = 0, sufAt = 0;
+            const DictNode* r = WrapTryConcat(g_wrap.pend, g_wrap.pendLen, s, len,
+                                              cand, &fullLen, &sufAt);
+            if (r && r->len >= 4 && r->len < WRAP_MAX_CHARS)
+            {
+                wmemcpy(g_wrap.full, cand, fullLen + 1);
+                g_wrap.fullLen = fullLen;
+                g_wrap.preLen  = g_wrap.pendLen;
+                g_wrap.sufAt   = sufAt;
+                g_wrap.node    = r;
+                g_wrap.pendLen = 0;
+
+                size_t tlen = r->len;
+                size_t est  = (tlen * g_wrap.preLen + fullLen / 2) / fullLen; // 英文比例->译文字符
+                if (est < 2) est = 2;
+                if (est > tlen - 2) est = tlen - 2;
+                size_t cut = PickSplitIndex(r->trans, tlen);
+                if (cut > est + tlen / 4 || est > cut + tlen / 4)
+                    cut = est;   // 标点离比例点太远就按比例硬切
+                if (cut < 1) cut = 1;
+                if (cut > tlen - 1) cut = tlen - 1;   // 两行至少各 1 字符
+                g_wrap.cut = cut;
+
+                wmemcpy(g_half1, r->trans, cut);
+                g_half1[cut] = L'\0';
+                wmemcpy(g_half2, r->trans + cut, tlen - cut);
+                g_half2[tlen - cut] = L'\0';
+                InterlockedIncrement(&g_wrapHits);
+
+                // 静默吸收: 本帧段2不显示（前缀行本帧已显示英文, 下一帧起换译文前半）
+                return nullptr;
+            }
+        }
+        return nullptr;   // HUD 噪音等无关文本: 维持稳定态
+    }
+
+    // ---------- LEARN: 段1 已缓存, 等段2 拼接验证 ----------
+    if (g_wrap.mode == WRAP_LEARN && g_wrap.pendLen)
+    {
+        // 同文本每帧重画: 刷新 TTL 保持缓存
+        if (len == g_wrap.pendLen && wmemcmp(s, g_wrap.pend, len) == 0)
+        {
+            g_wrap.pendTick = now;
+            return nullptr;
+        }
+
+        // 疑似段2: 补空格/直接连两种变体查词典
+        // （译文长度上界 guard: g_half1/g_half2 定长 256, 超长译文无法安全切分）
+        if (WrapLooksLikeSuffix(len))
+        {
+            wchar_t cand[WRAP_MAX_CHARS + 1];
+            size_t  fullLen = 0, sufAt = 0;
+            const DictNode* r = WrapTryConcat(g_wrap.pend, g_wrap.pendLen, s, len,
+                                              cand, &fullLen, &sufAt);
+            if (r && r->len >= 4 && r->len < WRAP_MAX_CHARS)
+            {
+                // 命中 -> 进入稳定态: 存完整原文/折行位置, 预计算两行译文
+                wmemcpy(g_wrap.full, cand, fullLen + 1);
+                g_wrap.fullLen = fullLen;
+                g_wrap.preLen  = g_wrap.pendLen;
+                g_wrap.sufAt   = sufAt;
+                g_wrap.node    = r;
+                g_wrap.mode    = WRAP_STABLE;
+                g_wrap.pendLen = 0;
+
+                size_t tlen = r->len;
+                size_t est  = (tlen * g_wrap.preLen + fullLen / 2) / fullLen; // 英文比例->译文字符
+                if (est < 2) est = 2;
+                if (est > tlen - 2) est = tlen - 2;
+                size_t cut = PickSplitIndex(r->trans, tlen);
+                if (cut > est + tlen / 4 || est > cut + tlen / 4)
+                    cut = est;   // 标点离比例点太远就按比例硬切
+                if (cut < 1) cut = 1;
+                if (cut > tlen - 1) cut = tlen - 1;   // 两行至少各 1 字符
+                g_wrap.cut = cut;
+
+                wmemcpy(g_half1, r->trans, cut);
+                g_half1[cut] = L'\0';
+                wmemcpy(g_half2, r->trans + cut, tlen - cut);
+                g_half2[tlen - cut] = L'\0';
+                InterlockedIncrement(&g_wrapHits);
+
+                // 静默吸收: 本帧段2不显示（前缀行本帧已显示英文, 下一帧起换译文前半）
+                return nullptr;
+            }
+        }
+
+        // 另一疑似段1（换句/别的 HUD 文本也以词中字符结尾）: 滚动替换缓存。
+        // 不直接重置状态机 —— 每帧穿插的 HUD 常量文本若每帧都触发重置,
+        // 后缀段将永远无法与段1 配对（IDLE->LEARN->IDLE 抖动, 永远拼不上）。
+        if (WrapLooksLikePrefix(s, len))
+        {
+            wmemcpy(g_wrap.pend, s, len);
+            g_wrap.pend[len] = L'\0';
+            g_wrap.pendLen   = len;
+            g_wrap.pendTick  = now;
+        }
+        // 其他短文本/噪音: 不动状态机（保持 LEARN, 靠 TTL 自然过期）
+        return nullptr;
+    }
+
+    // ---------- IDLE: 学习疑似段1（够长 + 尾字符是词中字符） ----------
+    if (g_wrap.mode == WRAP_IDLE && WrapLooksLikePrefix(s, len))
+    {
+        wmemcpy(g_wrap.pend, s, len);
+        g_wrap.pend[len] = L'\0';
+        g_wrap.pendLen   = len;
+        g_wrap.pendTick  = now;
+        g_wrap.mode      = WRAP_LEARN;
+    }
     return nullptr;
 }
 
@@ -1407,7 +1668,16 @@ static __int64 __fastcall HookFormat(wchar_t* dst, const wchar_t* fmt,
     if (fmt && *fmt)
     {
         const DictNode* r = LookupNode(fmt, &g_hitB, &g_missB);
-        if (r) fmt = r->trans;
+        if (r)
+        {
+            fmt = r->trans;
+        }
+        else if (!wcschr(fmt, L'%') && !wcschr(fmt, L'\n'))
+        {
+            // 整句/trim 均未命中: 走折行重组（含 % 的模板串与内嵌换行的完整文本不参与）
+            const wchar_t* w = WrapProcess(fmt, wcslen(fmt));
+            if (w) fmt = w;
+        }
     }
     return g_origFormat(dst, fmt, cap, args, argc);
 }
@@ -1706,8 +1976,8 @@ static DWORD WINAPI StatsThread(LPVOID)
     for (;;)
     {
         Sleep(STATS_PERIOD_MS);
-        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | dumped=%u | fonts=%ld",
-            g_hitA, g_missA, g_hitB, g_missB, g_dumpCount, g_fidCacheN);
+        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | wrap=%ld | dumped=%u | fonts=%ld",
+            g_hitA, g_missA, g_hitB, g_missB, g_wrapHits, g_dumpCount, g_fidCacheN);
         // 周期落盘 dump 收集（替代逐条 fflush, 防切界面卡顿; 崩溃最多丢本轮周期数据）
         if (g_dumpFile)
         {
@@ -1745,7 +2015,7 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7.2.2: text replacement + CJK glyph layer (txt dict) ====");
+    Log("==== SR3R_I18N v7.3: text replacement + CJK glyph layer (txt dict, wrap-rejoin) ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
