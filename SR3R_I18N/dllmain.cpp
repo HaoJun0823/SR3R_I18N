@@ -982,13 +982,12 @@ static bool FinishFont(FakeFont* f)
     uint32_t nCellsWanted = f->nCells;   // 截断前记录（日志用）
     uint32_t rows = (f->nCells + perRow - 1) / perRow;
     uint32_t maxRows = (16384 - offH) / f->cellH - 1;   // 末尾恒留 1 行空白 cell（缺字槽位指向这里）
-    if (rows > maxRows && W < 16384)
+    if (rows > maxRows && W < 8192)
     {
         // 显存换全字覆盖: 加宽伪图集减少截断
-        // （font1 官方 4096 宽仅 18 列; 8192 宽 37 列仍不够 2656 字, 16384 宽 74 列上限 4736 字;
-        //   BGRA8 16384 宽满高上限约 1GB, 实际 font1 约 670MB, 现代 8G 显卡无压力）
+        // （font1 官方 4096 宽仅 18 列; 8192 宽 37 列; 16384 宽曾致卡死, 回退）
         uint32_t oldW = W;
-        W = 16384;
+        W = 8192;
         perRow = W / f->cellW;
         rows = (f->nCells + perRow - 1) / perRow;
         maxRows = (16384 - offH) / f->cellH - 1;
