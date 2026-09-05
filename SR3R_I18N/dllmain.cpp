@@ -377,6 +377,25 @@ static bool TrimRange(const wchar_t* s, size_t len, size_t* outStart, size_t* ou
     return true;
 }
 
+// KEY 空格规范化: 引擎折行/查表前会把连续空格压缩为单空格（实测: 词典 1917/9630 条
+// KEY 含连续空格, 引擎侧 text 全是单空格形态, 两侧永不匹配）。
+// 加载时对每个 KEY 建规范化副本键; 运行时对未命中文本先规范化再查一次。
+// 返回规范化后长度（源里无连续空格时返回 0, 无需副本）
+static size_t NormalizeKey(const wchar_t* s, size_t len, wchar_t* out, size_t outCap)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < len; ++i)
+    {
+        wchar_t c = s[i];
+        if (c == L' ' && w > 0 && out[w - 1] == L' ') continue;   // 压连续空格
+        if (w >= outCap) return 0;
+        out[w++] = c;
+    }
+    if (w == len) return 0;                                       // 未变化: 无需副本
+    out[w] = L'\0';
+    return w;
+}
+
 // ---------- DumpText（未命中收集, SRWLOCK 保护） ----------
 struct DumpNode { uint32_t crc; DumpNode* next; };
 
@@ -463,6 +482,18 @@ static const DictNode* LookupNode(const wchar_t* s, volatile LONG* hit, volatile
         }
     }
 
+    // 空格规范化重查（引擎把连续空格压成单空格后到来, 词典原键含双空格）
+    if (len <= 512)
+    {
+        wchar_t norm[513];
+        size_t nl = NormalizeKey(s, len, norm, 512);
+        if (nl)
+        {
+            r = DictLookup(norm, nl);
+            if (r) { InterlockedIncrement(hit); return r; }
+        }
+    }
+
     InterlockedIncrement(miss);
     DumpText(s, len);
     return nullptr;
@@ -529,7 +560,9 @@ static bool WrapLooksLikeSuffix(size_t len)
 
 // 拼接 pend + 段2 查词典。命中返回节点, 并把完整句写入 out（含 NUL）,
 // outLen=完整句长度, outSufAt=后缀行在完整句中的起点。
-// 变体1: pend + ' ' + seg（词间折行, 空格被吞）; 变体2: pend + seg（连字符断词/引擎去空格）
+// 变体1: pend + ' ' + seg（词间折行, 空格被吞）; 变体2: pend + seg（连字符断词/引擎去空格）;
+// 变体3: 拼接结果空格规范化后重查（词典原键含双空格）。
+// 命中时 out 内容为查表所用文本（与词典键对齐）, sufAt 按该文本计算。
 static const DictNode* WrapTryConcat(const wchar_t* pend, size_t plen,
                                      const wchar_t* s, size_t len,
                                      wchar_t* out, size_t* outLen, size_t* outSufAt)
@@ -546,6 +579,26 @@ static const DictNode* WrapTryConcat(const wchar_t* pend, size_t plen,
     out[plen + len] = L'\0';
     r = DictLookup(out, plen + len);
     if (r) { *outLen = plen + len; *outSufAt = plen; return r; }
+
+    // 变体3: 规范化重查（覆盖词典键含连续空格的情形）
+    {
+        wchar_t norm[WRAP_MAX_CHARS];
+        size_t total = plen + 1 + len;
+        size_t nl = NormalizeKey(out, total, norm, WRAP_MAX_CHARS - 1);
+        if (nl)
+        {
+            r = DictLookup(norm, nl);
+            if (r)
+            {
+                wmemcpy(out, norm, nl + 1);          // 完整句以规范化形态入稳定态
+                *outLen = nl;
+                // 后缀行起点 = pend 长度（规范化只影响 pend 与段2 间空隙, 不变 pend 本身）
+                // 精确算: 找 norm 中段2 的起始位置（从尾部回扫 len 字符）
+                *outSufAt = (nl >= len) ? nl - len : 0;
+                return r;
+            }
+        }
+    }
     return nullptr;
 }
 
@@ -1881,10 +1934,20 @@ static void AddDictEntry(const wchar_t* key, const wchar_t* val,
     origW[effLen] = L'\0';
 
     if (DictInsert(origW, (uint32_t)effLen, transW)) ++*loaded;
+    // 空格规范化副本键（KEY 含连续空格时, 引擎侧永远以单空格形态到来）
+    {
+        wchar_t norm[4097];
+        size_t nl = NormalizeKey(origW, effLen, norm, 4096);
+        if (nl && DictInsert(norm, (uint32_t)nl, transW)) ++*loaded;   // 计入规范键
+    }
     size_t b, tl;
     if (TrimRange(origW, effLen, &b, &tl) && !(b == 0 && tl == effLen))
     {
         if (DictInsert(origW + b, (uint32_t)tl, transW)) ++*loaded;   // 计入 trim 键
+        // trim 后仍可能含连续空格, 同样补规范键
+        wchar_t norm[4097];
+        size_t nl = NormalizeKey(origW + b, tl, norm, 4096);
+        if (nl && DictInsert(norm, (uint32_t)nl, transW)) ++*loaded;
     }
 }
 
@@ -2015,7 +2078,7 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7.3: text replacement + CJK glyph layer (txt dict, wrap-rejoin) ====");
+    Log("==== SR3R_I18N v7.3.1: text replacement + CJK glyph layer (txt dict, wrap-rejoin, space-norm) ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
