@@ -249,6 +249,10 @@ static void* ArenaAlloc(size_t n)
 // 词典加载后置 1（未加载时字形层不激活）
 static volatile LONG g_dictReady = 0;
 
+// 词典是否成功加载（MainThread 依据 LoadDictDir 返回值置位;
+// 为 0 时 FontFileThread 无条件注入内置内核字符集, 不依赖 g_charCount 隐式推断）
+static volatile LONG g_dictLoaded = 0;
+
 // 中文/非 ASCII 字符集（65536 位 bitmap, 词典译文收集）
 static uint8_t  g_charSet[8192];
 static uint32_t g_charCount = 0;
@@ -1300,26 +1304,27 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
     for (int i = 300; i--; ) { if (g_dictReady) break; Sleep(100); }
     if (!g_dictReady) { Log("font: dict not ready, glyph layer disabled"); return 0; }
 
-    // 词典字符集 + 全角标点/符号保险集
+    // 字符集来源二选一（显式标志, 不依赖执行顺序/隐式计数）:
+    //   g_dictLoaded=1 -> 词典已收集译文 charset + 全角标点 extras
+    //   g_dictLoaded=0 -> font-only 模式: 注入内核汉化固化字符集(charset_data.h) + extras
     static const wchar_t extra[] =
         L"，。？！：；、·—…“”‘’（）《》〈〉【】〔〕「」『』％℃°±×÷©®™"
         L"０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
         L"ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ";
-    for (const wchar_t* p = extra; *p; ++p) CharSetAdd(*p);
-
-    if (g_charCount == 0)
+    if (g_dictLoaded)
     {
-        // font-only 模式: 词典目录缺失/为空, 注入内核汉化(F1)固化字符集
-        for (unsigned i = 0; i < kCharsetKernelCount; ++i)
-        {
-            CharSetAdd((wchar_t)kCharsetKernel[i].cp);
-            g_charFreq[kCharsetKernel[i].cp] = kCharsetKernel[i].freq;  // 频率表覆盖(嵌入时未计 extra)
-        }
-        Log("font: charset %u chars (kernel builtin)", g_charCount);
+        for (const wchar_t* p = extra; *p; ++p) CharSetAdd(*p);
+        Log("font: charset %u chars (dict) + extras", g_charCount);
     }
     else
     {
-        Log("font: charset %u chars (dict) + extras", g_charCount);
+        for (unsigned i = 0; i < kCharsetKernelCount; ++i)
+        {
+            CharSetAdd((wchar_t)kCharsetKernel[i].cp);
+            g_charFreq[kCharsetKernel[i].cp] = kCharsetKernel[i].freq;  // 频率直接赋值(非累加)
+        }
+        for (const wchar_t* p = extra; *p; ++p) CharSetAdd(*p);
+        Log("font: charset %u chars (kernel builtin) + extras", g_charCount);
     }
 
     // 读 TTF（ini 字体文件名; 兼容旧名 font.ttf）
@@ -1759,7 +1764,9 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     //    词典目录缺失/为空时进 font-only 模式: hooks 照装, 字形层用内置字符集）
     uint32_t files = 0, loaded = 0, hashKeys = 0, cjkEntries = 0;
     bool dictOk = LoadDictDir(dictDir, &files, &loaded, &hashKeys, &cjkEntries);
-    if (!dictOk)
+    if (dictOk)
+        InterlockedExchange(&g_dictLoaded, 1);   // 字形层 charset 以词典收集为准
+    else
         Log("dict: load failed/skipped, font-only mode (kernel text + builtin charset)");
 
     // 3. DumpText（ini 可关）
