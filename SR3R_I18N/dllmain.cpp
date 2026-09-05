@@ -1431,10 +1431,31 @@ static bool ParseLeLine(wchar_t* line, LeLine* out)
     if (*p != L'"') return false;
     ++p;
     wchar_t* key = p;
-    // KEY 内转义在 le_strings 键中不存在（键为消息名/原文, 无引号）; 找闭合引号
-    while (*p && *p != L'"') ++p;
-    if (!*p) return false;
-    *p = L'\0';
+
+    // KEY 扫描 + 原地反转义（\\ \" \n \r; 未知转义按原样）。
+    // le_strings 内核键内无引号, 但 voice 词典键 = 英文原句, 可含转义引号
+    // （如 "What happened to, \"I do my own stunts\"?"）; 遇非转义引号才算闭合。
+    // 读指针 p / 写指针 w: 反转义后 w <= p, 写入不影响未读部分。
+    wchar_t* w = p;
+    while (*p)
+    {
+        if (*p == L'\\')
+        {
+            ++p;
+            if      (*p == L'n')  *w++ = L'\n';
+            else if (*p == L'r')  *w++ = L'\r';
+            else if (*p == L'\\') *w++ = L'\\';
+            else if (*p == L'"')  *w++ = L'"';
+            else if (*p)          *w++ = *p;   // 未知转义按原样
+            else break;
+            ++p;
+        }
+        else if (*p == L'"')   // 非转义引号, KEY 闭合
+            break;
+        else *w++ = *p++;
+    }
+    if (*p != L'"') return false;
+    *w = L'\0';      // 反转义后的 KEY 终结（写入位置 <= 闭合引号, 安全）
     ++p;
     while (*p == L' ' || *p == L'\t') ++p;
     if (*p != L':') return false;
@@ -1445,7 +1466,8 @@ static bool ParseLeLine(wchar_t* line, LeLine* out)
     wchar_t* val = p;
 
     // 值反转义（\\ \" \n \r）, 原地写（sr3le_extract.py 输出含 \r 转义, 不处理会混入字母 r）
-    wchar_t* w = p;
+    // 注意: 上面 KEY 段已用过 w, 这里重绑到值起点
+    w = p;
     while (*p)
     {
         if (*p == L'\\')
@@ -1723,7 +1745,7 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7: text replacement + CJK glyph layer (txt dict) ====");
+    Log("==== SR3R_I18N v7.2.2: text replacement + CJK glyph layer (txt dict) ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
