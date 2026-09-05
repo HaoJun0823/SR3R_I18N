@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '43497faf-b81f-41fe-a304-24a7c296a4d0'
-  PropagateID: '43497faf-b81f-41fe-a304-24a7c296a4d0'
-  ReservedCode1: '201e6d63-2757-4fe4-b932-5fee0a096c25'
-  ReservedCode2: '201e6d63-2757-4fe4-b932-5fee0a096c25'
+  ProduceID: '52da9bba-676e-4325-ade2-b075f7c1c255'
+  PropagateID: '52da9bba-676e-4325-ade2-b075f7c1c255'
+  ReservedCode1: '6775c2f0-baf8-47d7-82db-b62aaa540002'
+  ReservedCode2: '6775c2f0-baf8-47d7-82db-b62aaa540002'
 ---
 
 # SR3R_I18N — Saints Row The Third Remastered External Localization DLL
@@ -63,7 +63,7 @@ English (brief):
 | `charlist.txt` | 字符清单（可选；补齐词典未覆盖的官方用字，如“齿”）/ charset list (optional; adds glyphs missing from the dictionary, e.g. 齿) |
 | `SourceHanSansHWSC-VF.ttf` | 中文字体（可在 ini 换名）/ CJK font (rename via ini) |
 | `SR3R_I18N.log` | 运行日志 / runtime log |
-| `DumpText.dtxt` | 未命中文本自动收集（可在 ini 关闭）/ auto-collected untranslated strings (toggleable) |
+| `DumpText.dtxt` | 未命中文本自动收集（v7.5.2 起默认关，可在 ini 开启）/ auto-collected untranslated strings (off by default since v7.5.2, opt-in via ini) |
 
 要求 / Requirements: x64 游戏版本；需已安装 ASI Loader（本仓库附带的方式）或等价注入器。
 x64 game build; requires ASI Loader (bundled approach) or an equivalent injector.
@@ -96,11 +96,11 @@ x64 game build; requires ASI Loader (bundled approach) or an equivalent injector
 [settings]
 dict_dir = dict                              ; 词典文件夹（相对 asi）/ dict folder (relative to the asi)
 font_file = SourceHanSansHWSC-VF.ttf         ; 中文字体文件名（相对 asi）/ CJK TTF file (relative to the asi)
-dump_enabled = 1                             ; 1=收集未命中文本 0=关闭 / collect untranslated text
+dump_enabled = 0                             ; v7.5.2 默认关: 收集未命中文本（内核汉化接管后无意义）/ collect untranslated text (off by default since v7.5.2)
 lang_early = 1                               ; v7.4 语言服务层整句替换 / language-service early swap
 subtitle_early = 1                           ; v7.5 字幕绘制入口整句替换（折行前）/ subtitle entry swap (before word-wrap)
 charlist_file = charlist.txt                 ; v7.5.1 字符清单（补齐词典外用字，可选）/ charset list (optional, fills dict-missing glyphs)
-early_diag = 1                               ; 命中/miss 诊断日志 / hit/miss diagnostic logs
+early_diag = 0                               ; v7.5.2 默认关: 命中/miss 探针诊断（开发期调试用）/ probe diagnostics (off by default, dev only)
 ```
 
 词典加载失败或文件夹为空时，DLL 进入 idle 模式：只打日志，不装任何 hook。
@@ -248,7 +248,7 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
 `SR3R_I18N.log` 关键行 / Key log lines:
 
 ```
-cfg: ... loaded (dict_dir=dict font_file=... dump=1)
+cfg: ... loaded (dict_dir=dict font_file=... dump=0)
 dict: 96 files, ... keys, 0 HASH_ skipped, ... cjk, ... bad, arena .../131072 KB
 charlist: ...merged 624 new chars (total 2996, ...)
 font0: upgrade requested (first CJK text)
@@ -259,11 +259,14 @@ v7.5 active: dict=... keys (... files), hooks A=1 B=1 C=1 D=1 E=1 F=1 G=1 H=1 I=
 stats: draw hit=... miss=... | format hit=... miss=... | wrap=... | sub hit=... miss=... | dumped=... | fonts=...
 ```
 
+> v7.5.2 起探针统计行（early/setText/setTag/refresh/wrapEv）已退役不再输出，仅保留主统计行。
+> Since v7.5.2 the probe stat lines (early/setText/setTag/refresh/wrapEv) are retired; only the main stats line remains.
+
 排查速查 / Quick diagnosis:
 - 中文全空白 → 查 `font0: LIVE` 是否出现；没有则看它上一行报错 / all CJK blank → check for `font0: LIVE`; read the error line above it if missing
 - 崩溃在渲染 → 先怀疑 kernStart 兜底（陷阱 1）/ crash in rendering → suspect kernStart fallback first (pitfall 1)
 - `signature mismatch, ABORT` → 游戏更新，需重新定位特征码 / game updated; re-derive signatures
-- `DumpText.dtxt` 每 30 秒批量落盘（`dump_enabled=1` 时）/ `DumpText.dtxt` flushes in 30 s batches when enabled
+- `DumpText.dtxt` 默认不再收集（v7.5.2）；需要时在 ini 设 `dump_enabled=1`，每 30 秒批量落盘 / miss collection is off by default since v7.5.2; set `dump_enabled=1` to re-enable (30 s flush batches)
 
 ---
 

@@ -202,9 +202,9 @@ static Config g_cfg = {
     L"origin",                     // 默认: scripts/origin/
     L"SourceHanSansHWSC-VF.ttf",   // 默认字体
     L"charlist.txt",               // 默认: scripts/charlist.txt
-    true,
+    false,                         // v7.5.2: dump 默认关（内核汉化已接管, 收集无意义; 开发期 ini 置 1）
     true,                          // lang_early
-    true,                          // early_diag
+    false,                         // v7.5.2: early_diag 默认关（探针已退役; 开发期 ini 置 1）
     true,                          // subtitle_early
 };
 
@@ -2627,18 +2627,8 @@ static DWORD WINAPI StatsThread(LPVOID)
         Sleep(STATS_PERIOD_MS);
         Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | wrap=%ld | sub hit=%ld miss=%ld | dumped=%u | fonts=%ld",
             g_hitA, g_missA, g_hitB, g_missB, g_wrapHits, g_hitJ, g_missJ, g_dumpCount, g_fidCacheN);
-        Log("stats: early cur=%ld/%ld txt=%ld/%ld | fmtFrom[other/wrap/crib/lua/textCur/tmpl]=%ld/%ld/%ld/%ld/%ld/%ld | setText=%I64d",
-            g_earlyCurHit, g_earlyCurMiss, g_earlyTxtHit, g_earlyTxtMiss,
-            g_fmtFrom[0], g_fmtFrom[1], g_fmtFrom[2], g_fmtFrom[3], g_fmtFrom[4], g_fmtFrom[5],
-            g_setTextDiag);
-        Log("stats: setTag[0..15]=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld",
-            g_setTagCnt[0], g_setTagCnt[1], g_setTagCnt[2], g_setTagCnt[3], g_setTagCnt[4],
-            g_setTagCnt[5], g_setTagCnt[6], g_setTagCnt[7], g_setTagCnt[8], g_setTagCnt[9],
-            g_setTagCnt[10], g_setTagCnt[11], g_setTagCnt[12], g_setTagCnt[13], g_setTagCnt[14],
-            g_setTagCnt[15]);
-        Log("stats: refreshSeen=%ld refreshLog=%ld", g_refreshSeen, g_refreshLog);
-        Log("stats: wrapEv[learn/ttl/concat/replace/stable/takeover]=%ld/%ld/%ld/%ld/%ld/%ld",
-            g_wrapCnt[0], g_wrapCnt[1], g_wrapCnt[2], g_wrapCnt[3], g_wrapCnt[4], g_wrapCnt[5]);
+        // v7.5.2: v7.4 探针统计（early/setText/setTag/refresh/wrapEv）不再输出，计数仍维护;
+        //   需要时临时恢复下三行 Log 调试。
         // 周期落盘 dump 收集（替代逐条 fflush, 防切界面卡顿; 崩溃最多丢本轮周期数据）
         if (g_dumpFile)
         {
@@ -2676,7 +2666,7 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7.5.1: charlist merge + atlas capacity autoshrink ====");
+    Log("==== SR3R_I18N v7.5.2: probe/dump retired (ini defaults off) ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
@@ -2787,7 +2777,7 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     CloseHandle(CreateThread(nullptr, 0, FontFileThread, hSelf, 0, nullptr));
 
     CloseHandle(CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr));
-    Log("v7.5.1 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d F=%d G=%d H=%d I=%d J=%d, idling",
+    Log("v7.5.2 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d F=%d G=%d H=%d I=%d J=%d, idling",
         g_dictCount, files, (int)a, (int)b, (int)c, (int)d, (int)e, (int)f, (int)g, (int)h, (int)i, (int)j);
     return 0;
 }
