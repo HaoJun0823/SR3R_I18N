@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '9bb11a41-787c-4e80-bd77-8647fda7a7b1'
-  PropagateID: '9bb11a41-787c-4e80-bd77-8647fda7a7b1'
-  ReservedCode1: '4bc59b62-e6a9-4fd4-8500-db09a9cca016'
-  ReservedCode2: '4bc59b62-e6a9-4fd4-8500-db09a9cca016'
+  ProduceID: '43497faf-b81f-41fe-a304-24a7c296a4d0'
+  PropagateID: '43497faf-b81f-41fe-a304-24a7c296a4d0'
+  ReservedCode1: '201e6d63-2757-4fe4-b932-5fee0a096c25'
+  ReservedCode2: '201e6d63-2757-4fe4-b932-5fee0a096c25'
 ---
 
 # SR3R_I18N — Saints Row The Third Remastered External Localization DLL
@@ -60,6 +60,7 @@ English (brief):
 | `SR3R_I18N.asi` | 主 DLL（ASI Loader 加载，根目录 `binkw64.dll` 是加载器，勿删 / the loader, do not delete） |
 | `SR3R_I18N.ini` | 配置（UTF-8）/ configuration (UTF-8) |
 | `dict\*.txt` | 词典文件夹，le_strings 格式 / dictionary folder, le_strings format |
+| `charlist.txt` | 字符清单（可选；补齐词典未覆盖的官方用字，如“齿”）/ charset list (optional; adds glyphs missing from the dictionary, e.g. 齿) |
 | `SourceHanSansHWSC-VF.ttf` | 中文字体（可在 ini 换名）/ CJK font (rename via ini) |
 | `SR3R_I18N.log` | 运行日志 / runtime log |
 | `DumpText.dtxt` | 未命中文本自动收集（可在 ini 关闭）/ auto-collected untranslated strings (toggleable) |
@@ -98,6 +99,7 @@ font_file = SourceHanSansHWSC-VF.ttf         ; 中文字体文件名（相对 as
 dump_enabled = 1                             ; 1=收集未命中文本 0=关闭 / collect untranslated text
 lang_early = 1                               ; v7.4 语言服务层整句替换 / language-service early swap
 subtitle_early = 1                           ; v7.5 字幕绘制入口整句替换（折行前）/ subtitle entry swap (before word-wrap)
+charlist_file = charlist.txt                 ; v7.5.1 字符清单（补齐词典外用字，可选）/ charset list (optional, fills dict-missing glyphs)
 early_diag = 1                               ; 命中/miss 诊断日志 / hit/miss diagnostic logs
 ```
 
@@ -132,12 +134,14 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
    - Engine font layout: 208-byte header + metrics (16 B/glyph) + xtab/ytab (4 B/glyph) + kern table.
    - 伪造对象把 `count` 扩为 0xFFE0（覆盖 0x20–0xFFFF）；官方槽位区（约 336 字形）的 metrics/xtab/ytab/kern **原样照抄**，保证英文渲染逐像素不变。
    - The fake extends `count` to 0xFFE0 (0x20–0xFFFF); the official slot region (~336 glyphs) is copied byte-for-byte, so English rendering is pixel-identical.
-   - 中文槽位 metrics：advance=cellW、宽=cellW、kernStart=-1（无 kern），xtab/ytab 指向自建图集区。
-   - CJK slot metrics: advance=cellW, width=cellW, kernStart=-1 (no kerning), xtab/ytab point into the new atlas region.
+   - 中文槽位 metrics：advance=缩放后步进、quad 宽=cellW（可收窄）、kernStart=-1（无 kern），xtab/ytab 指向自建图集区；quad/UV 高度锁官方 cellH（对象级，中英共享，不可改）。
+   - CJK slot metrics: advance = scaled advance, quad width = cellW (shrinkable), kernStart=-1 (no kerning), xtab/ytab point into the new atlas region; quad/UV height is locked to the official cellH (object-level, shared with English — untouchable).
 
 3. **两阶段后台构建**（/ Two-phase background build）
-   - 阶段 1（后台线程）：stb_truetype 按 cellH 光栅化全部词典字符 → 灰度 cell 缓存。
-   - Phase 1 (background thread): stb_truetype rasterizes every dictionary character at the font's cellH into a grayscale cell cache.
+   - 字符集 = 词典收集 ∪ charlist.txt（官方简体 le_data 用字，v7.5.1）→ 字形覆盖不再受词典用字限制。
+   - Charset = dictionary-collected ∪ charlist.txt (official simplified le_data charset, v7.5.1) → glyph coverage no longer bounded by dictionary text.
+   - 阶段 1（后台线程）：stb_truetype 光栅化全部字符 → 灰度 cell 缓存；容量不足时自适应收窄 cellW（字形等比缩小、底部坐官方基线）。
+   - Phase 1 (background thread): stb_truetype rasterizes every character into a grayscale cell cache; when capacity falls short, cellW auto-shrinks (glyphs scale uniformly, baseline pinned to the official one).
    - 阶段 2（后台线程）：读回官方图集（staging + 格式感知解码）→ 下方拼接中文区 → 创建 D3D11 纹理/SRV → 组装伪对象。
    - Phase 2 (background thread): read back the official atlas (staging + format-aware decode) → append the CJK region below → create D3D11 texture/SRV → assemble the fake object.
    - 构建期间引擎用官方字体渲染中文，被引擎自身边界检查安全拦截 → **短暂空白后自动恢复**，不崩溃、不花屏。
@@ -213,6 +217,16 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
     - 佐证：游侠汉化同样 hook 此函数入口（SIG3），词典 17411 条 KEY 全是英文整句 —— 折行残段问题在入口整串替换架构下天然不存在。
     - Corroboration: the ali213 patch hooks this same entry (SIG3) with 17,411 full-sentence keys — wrap-fragment misses simply cannot exist under entry-point whole-string replacement.
 
+13. **图集 cell 高度锁死，只能收窄宽度**（v7.5.1）/ **Atlas cell height is locked; only width can shrink**
+    - 反汇编实证：quad/UV 高度取自 font 对象 +22（对象级，中英文共享）；UV 宽度却是每槽位独立（metrics+4）。动高度会把英文一起压扁，动宽度只影响中文。
+    - Disassembly-verified: quad/UV height comes from font+22 (object-level, shared with English); UV width is per-slot (metrics+4). Changing height squashes English too; changing width only affects CJK.
+    - 容量不足时方案：cellW 自适应收窄（每轮 -8 直到 列×行 ≥ 字符数），字形按 cellW/cellH 等比缩小、底部对齐官方基线 —— 不变形、英文零影响。
+    - Capacity fix: auto-shrink cellW (-8 per round until cols×rows ≥ glyph count); glyphs scale uniformly by cellW/cellH with the baseline pinned — no distortion, zero English impact.
+    - 前提：思源黑体 CJK 字形 advance=100% em（全宽），横向压扁必然变形，所以必须等比缩放而非只压宽度。
+    - Prerequisite: Source Han Sans CJK glyphs advance 100% em (full-width), so horizontal-only compression would distort — uniform scaling is mandatory.
+    - charlist.txt 第 0 行是零宽字符水印（0x200B-0x200D），解析时必须跳过，否则会混入数千个“幽灵字符”。
+    - charlist.txt line 0 is a zero-width watermark row (0x200B-0x200D); the parser must skip it or thousands of phantom characters slip in.
+
 ---
 
 ## 性能与显存 / Performance & VRAM
@@ -221,7 +235,7 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
 |---|---|
 | 查表延迟 / Lookup latency | 微秒级（CRC 哈希）/ microseconds (CRC hash) |
 | font0 图集 / font0 atlas | 2048×13712 BGRA8 ≈ 107 MB VRAM |
-| font1 图集 / font1 atlas | 8192×15908 BGRA8 ≈ 497 MB VRAM（官方宽 4096 装不下全字符集，按需加宽 / widened from 4096 because the official width cannot fit the full charset） |
+| font1 图集 / font1 atlas | 8192×16348 BGRA8 ≈ 508 MB VRAM（官方宽 4096 装不下全字符集，按需加宽 / widened from 4096 because the official width cannot fit the full charset） |
 | 首次构建 / First build | 每字体一次，后台线程，font0 ≈ 1 s / font1 ≈ 4 s；期间中文短暂空白 / once per font, background; brief blank while building |
 | 常驻开销 / Steady-state | 每 draw 一次哈希查表 + 一次字符集扫描；无可测量帧耗 / one hash lookup + one charset scan per draw; no measurable frame cost |
 
@@ -236,6 +250,7 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
 ```
 cfg: ... loaded (dict_dir=dict font_file=... dump=1)
 dict: 96 files, ... keys, 0 HASH_ skipped, ... cjk, ... bad, arena .../131072 KB
+charlist: ...merged 624 new chars (total 2996, ...)
 font0: upgrade requested (first CJK text)
 font0: rasterized 2287 cells (...)
 font0: src atlas 2048x1024 fmt=BC3(76) ... RowPitch=8192
@@ -269,7 +284,7 @@ stats: draw hit=... miss=... | format hit=... miss=... | wrap=... | sub hit=... 
 ## 限制 / Limitations
 
 - 仅覆盖宽字符文本链路（UI/字幕/菜单）；引擎内部窄字符路径（如某些调试输出）不处理 / wide-char paths only; narrow internal paths untouched
-- 简繁混合超大约 2360 字时 font1 图集需加宽或降 cellH（当前简体 2293 字已接近 8192 宽上限）/ if a simplified+traditional mix exceeds ~2360 glyphs, widen the font1 atlas or reduce cellH
+- 字符集超容量时 font1 自动收窄 cellW（v7.5.1），中文字形缩小到约 78% 宽度；更高容量需继续加宽图集（显存线性增长）/ when the charset exceeds capacity, font1 auto-shrinks cellW (v7.5.1), rendering CJK at ~78% width; more capacity requires a wider atlas (VRAM grows linearly)
 - 游戏更新会使特征码失效（设计为安全 idle，不会崩）/ game updates invalidate signatures (by design it idles safely, never crashes)
 - 未命中文本收集需要 `dump_enabled=1` 且重启后生效 / miss collection requires `dump_enabled=1`, applied on restart
 

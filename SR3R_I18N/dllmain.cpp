@@ -104,6 +104,14 @@ static constexpr uint64_t VA_TEXTOBJ_REFRESH = 0x14082DD10ULL;   // RefreshText(
 static const uint8_t SIG_TEXTOBJ_REFRESH[16] = {
     0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7C,0x24,0x20,0x55 };
 
+// v7.5.1 中文字符集扩充配置
+//   字形层原始设计只收词典译文用字(2380), 内核汉化/官方 le_data 文本用字不在词典里
+//   -> 部分字缺字形空白("齿"等). 修复: 启动时加载 charlist.txt 合并进 g_charSet,
+//   来源覆盖 scripts/dict + le_data/schinese + le_data/voice_dumps_chinese 全量用字.
+//   格式: UTF-8, ';' 开头注释行, 数据行按频率降序直接排列字符, 零宽字符/控制/空白忽略.
+static constexpr size_t  CHARLIST_MAX_BYTES = (1 << 20);   // 1MB 上限
+static constexpr uint32_t CHARLIST_FREQ_BASE = 60000;      // 权重基值(>词典真实频率上限, 保证 charlist 顺序优先)
+
 // v7.5 字幕/HUD 绘制入口整串替换（游侠 ali213 SIG3 同点位; IDA 2026-09-06 实测）
 //   sub_1402D2BC0(text, a2, a3, a4): a1=宽字符串, 内部 sub_14085A1F0 折行布局后
 //   逐行绘制; a3<=0.1 时从尾部字面 \n<毫秒> 解析显示时长(atoi/1000), 否则 2s。
@@ -182,6 +190,7 @@ struct Config
     wchar_t dictDir[MAX_PATH];    // 词典文件夹（相对 asi 目录）
     wchar_t originDir[MAX_PATH];  // 联表文件夹（ID/HASH_ -> 英文原文; 相对 asi 目录）
     wchar_t fontFile[MAX_PATH];   // 字体 TTF 文件名（相对 asi 目录）
+    wchar_t charlistFile[MAX_PATH]; // v7.5.1: 字符清单文件名（相对 asi 目录; 空=禁用）
     bool     dumpEnabled;         // 未命中文本收集（DumpText.dtxt）
     bool     langEarly;           // v7.4: 语言服务返回层整句替换（引擎自切行）
     bool     earlyDiag;           // v7.4: 早期替换命中/Format miss 调用点诊断日志
@@ -192,6 +201,7 @@ static Config g_cfg = {
     L"dict",                       // 默认: scripts/dict/
     L"origin",                     // 默认: scripts/origin/
     L"SourceHanSansHWSC-VF.ttf",   // 默认字体
+    L"charlist.txt",               // 默认: scripts/charlist.txt
     true,
     true,                          // lang_early
     true,                          // early_diag
@@ -247,6 +257,7 @@ static void LoadConfig(const wchar_t* iniPath)
         if (_wcsicmp(key, L"dict_dir") == 0)         wcscpy_s(g_cfg.dictDir, val);
         else if (_wcsicmp(key, L"origin_dir") == 0)  wcscpy_s(g_cfg.originDir, val);
         else if (_wcsicmp(key, L"font_file") == 0)   wcscpy_s(g_cfg.fontFile, val);
+        else if (_wcsicmp(key, L"charlist_file") == 0) wcscpy_s(g_cfg.charlistFile, val);
         else if (_wcsicmp(key, L"dump_enabled") == 0) g_cfg.dumpEnabled = (*val != L'0');
         else if (_wcsicmp(key, L"lang_early") == 0)  g_cfg.langEarly  = (*val != L'0');
         else if (_wcsicmp(key, L"early_diag") == 0)  g_cfg.earlyDiag  = (*val != L'0');
@@ -255,8 +266,8 @@ static void LoadConfig(const wchar_t* iniPath)
         line = wcstok_s(nullptr, L"\r\n", &ctx);
     }
     VirtualFree(wbuf, 0, MEM_RELEASE);
-    Log("cfg: %ls loaded (dict_dir=%ls origin_dir=%ls font_file=%ls dump=%d early=%d diag=%d sub=%d)",
-        iniPath, g_cfg.dictDir, g_cfg.originDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled,
+    Log("cfg: %ls loaded (dict_dir=%ls origin_dir=%ls font_file=%ls charlist=%ls dump=%d early=%d diag=%d sub=%d)",
+        iniPath, g_cfg.dictDir, g_cfg.originDir, g_cfg.fontFile, g_cfg.charlistFile, (int)g_cfg.dumpEnabled,
         (int)g_cfg.langEarly, (int)g_cfg.earlyDiag, (int)g_cfg.subtitleEarly);
 }
 
@@ -336,6 +347,89 @@ static void CharSetAdd(wchar_t c)
         ++g_charCount;
     }
     if (g_charFreq[i] < 0xFFFFu) ++g_charFreq[i];   // 频率饱和计数
+}
+
+// charlist 字符: 已有词典频率则取 max(现有, 权重), 否则直接赋权重
+//   (不用 CharSetAdd 累加: 防同一字符多行重复推高排名)
+static void CharSetAddWeighted(wchar_t c, uint16_t w)
+{
+    if (c < 0x80) return;
+    if (c > 0xFFFD) return;
+    uint32_t i = (uint32_t)c;
+    if (!(g_charSet[i >> 3] & (1u << (i & 7))))
+    {
+        g_charSet[i >> 3] |= (uint8_t)(1u << (i & 7));
+        ++g_charCount;
+    }
+    if (g_charFreq[i] < w) g_charFreq[i] = w;
+}
+
+// ---------- v7.5.1: charlist.txt 加载（扩充字形层字符集） ----------
+// 返回: 合并的新增字符数（文件缺失/解析失败返回 0, 仅警告日志, 不影响主流程）
+static uint32_t LoadCharList(const wchar_t* path)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    { Log("charlist: %ls not found (optional, skip)", path); return 0; }
+    LARGE_INTEGER sz;
+    GetFileSizeEx(f, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (LONGLONG)CHARLIST_MAX_BYTES)
+    { Log("charlist: bad size %lld (skip)", sz.QuadPart); CloseHandle(f); return 0; }
+
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, (SIZE_T)sz.QuadPart,
+                                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    DWORD rd = 0;
+    BOOL ok = buf && ReadFile(f, buf, (DWORD)sz.QuadPart, &rd, nullptr);
+    CloseHandle(f);
+    if (!ok || rd != (DWORD)sz.QuadPart)
+    { Log("charlist: read failed"); if (buf) VirtualFree(buf, 0, MEM_RELEASE); return 0; }
+
+    // UTF-8 -> UTF-16（跳 BOM; 与 ini 同一套手工解析, 避开 CRT locale）
+    int utf8Off = (rd >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) ? 3 : 0;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off,
+                                   (int)(rd - utf8Off), nullptr, 0);
+    if (wlen <= 0 || wlen > (int)CHARLIST_MAX_BYTES / 2)
+    { Log("charlist: utf8 convert failed"); VirtualFree(buf, 0, MEM_RELEASE); return 0; }
+    auto* wbuf = static_cast<wchar_t*>(VirtualAlloc(nullptr, (SIZE_T)(wlen + 1) * sizeof(wchar_t),
+                                                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!wbuf) { VirtualFree(buf, 0, MEM_RELEASE); return 0; }
+    MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + utf8Off, (int)(rd - utf8Off), wbuf, wlen);
+    wbuf[wlen] = L'\0';
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    uint32_t added = 0, lines = 0;
+    uint32_t rank = 0;                       // 已遍历的有效字符数(频率降序假设)
+    wchar_t* p = wbuf;
+    while (*p)
+    {
+        wchar_t* eol = p;
+        while (*eol && *eol != L'\n' && *eol != L'\r') ++eol;
+        // 逐字符处理本行 [p, eol)
+        for (wchar_t* q = p; q < eol; ++q)
+        {
+            wchar_t ch = *q;
+            if (ch == L';') break;                       // 注释行(及行内注释)
+            uint32_t cp = (uint32_t)ch;
+            if (cp < 0x80 || cp < 0x20) continue;        // ASCII/控制
+            if (cp >= 0x200B && cp <= 0x200D) continue;  // 零宽字符(水印)
+            if (ch == L' ' || ch == L'\t') continue;
+            // 频率权重: 越靠前越高(仅用于容量截断时的优先级), 饱和下限 1
+            uint32_t w = CHARLIST_FREQ_BASE > rank ? CHARLIST_FREQ_BASE - rank : 1;
+            if (w > 0xFFFFu) w = 0xFFFFu;
+            if (!(g_charSet[cp >> 3] & (1u << (cp & 7)))) ++added;
+            CharSetAddWeighted(ch, (uint16_t)w);
+            ++rank;
+        }
+        ++lines;
+        p = eol;
+        if (*p == L'\r') ++p;   // CRLF / CR
+        if (*p == L'\n') ++p;
+    }
+    VirtualFree(wbuf, 0, MEM_RELEASE);
+    Log("charlist: %ls merged %u new chars (total %u, rankPos %u, lines %u)",
+        path, added, g_charCount, rank, lines);
+    return added;
 }
 
 static bool DictInsert(const wchar_t* key, uint32_t keyLen, const wchar_t* trans)
@@ -879,7 +973,7 @@ struct FakeFont
     uint32_t* cps;              // nCells
     uint32_t  nCells;
     uint32_t  blankY;           // 预留空白 cell 的图集 Y（缺字槽位指到这里, 超容量字符空白渲染）
-    uint16_t  cellW, cellH;
+    uint16_t  cellW, cellH;     // cellH=官方行高(不可变); cellW=光栅化宽度(容量不足时收窄)
     // 伪纹理对象（sub_14085D930 读 +8/+10 宽高; +20 变体数; +34 速度）
     uint8_t   fakeTexObj[64];
 };
@@ -1001,7 +1095,40 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
         f->state = 4; return 0;
     }
 
-    uint16_t cellW = cellH;  // 方块字 1:1
+    uint16_t cellW = cellH;  // 默认 1:1（字形满尺寸）
+    // v7.5.1: 容量自适应收窄（仅当默认容量装不下当前字符集时）
+    //   背景: charlist 合并后字符集约 2996, font1(220px) 1:1 容量 37*64=2368 装不下,
+    //   会截断低频字致缺字(齿 rank 2920 即被截). 字形 quad 高度锁 font+22(对象级,
+    //   中英共享不可动), 但 UV 宽度=metrics[+4] 是每槽位独立的 -> 中文 cell 可只收窄宽度.
+    //   方案: 等比缩小 -- 字形宽高都缩到 cellW/cellH 比例(不变形), 底部坐官方基线,
+    //   官方英文区照抄不受影响. 源字体 CJK 是全宽字形(思源 1000/1000 em),
+    //   横向压扁会变形, 必须等比.
+    //   迭代收缩: 1:1 -> 装不下 -> 宽度减 8 再算, 直到装下或宽到 32 下限(极小字才可能发生)
+    uint32_t nGuess = g_charCount;
+    {
+        // 官方图集真实尺寸: 引擎纹理对象 +8/+10 (u16 W/H; 不依赖 D3D 就绪)
+        uint32_t capW = 8192, offHGuess = 2048;
+        uint32_t offTexId = *(uint32_t*)((uint8_t*)off + 184);
+        void* texObj = (offTexId != 0xFFFFFFFFu) ? g_origTexObj((int)offTexId) : nullptr;
+        if (texObj)
+        {
+            uint32_t ow = *(uint16_t*)((uint8_t*)texObj + 8);
+            uint32_t oh = *(uint16_t*)((uint8_t*)texObj + 10);
+            if (ow >= 64 && ow <= 16384 && oh >= 64 && oh <= 16384)
+            {
+                if (ow > capW) capW = ow;          // 官方图集比 8192 还宽(罕见): 按原宽算
+                offHGuess = oh;                    // 官方区真实高度(容量高度预算)
+            }
+        }
+        while (nGuess > 1)
+        {
+            uint32_t per  = capW / cellW;                    // 图集每行列数
+            uint32_t maxR = (16384 - offHGuess) / cellH - 1; // 行数上限(16384 高预算, 末行恒留空白)
+            if (per >= 1 && (uint64_t)per * maxR >= nGuess) break;
+            if (cellW <= 32 + 8) break;                       // 收窄下限(32px 以下无意义)
+            cellW = (uint16_t)(cellW - 8);
+        }
+    }
     f->cellW = cellW; f->cellH = cellH;
     f->official = off;
 
@@ -1037,11 +1164,15 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
         f->cps[j] = kc;
     }
 
-    // 光栅化
-    float scale = stbtt_ScaleForPixelHeight(&g_stb, (float)cellH);
+    // 光栅化（v7.5.1: 等比缩小方案）
+    //   cellW 被收窄时(容量不足), 字形按 cellW 等比缩小(高=宽, 不变形),
+    //   底部坐官方基线(baseline 按满比例 cellH 计算, 与英文基线一致),
+    //   字形大小 ~cellW/cellH 比例(79%~100%), 略小于英文但排版和谐.
+    float fullScale = stbtt_ScaleForPixelHeight(&g_stb, (float)cellH);   // 官方满比例(基线用)
+    float scale     = stbtt_ScaleForPixelHeight(&g_stb, (float)cellW);   // 等比缩小(光栅化用, cellW<=cellH)
     int ascent, descent, gap;
     stbtt_GetFontVMetrics(&g_stb, &ascent, &descent, &gap);
-    int baseline = (int)((float)ascent * scale + 0.5f);
+    int baseline = (int)((float)ascent * fullScale + 0.5f);   // 基线=官方满比例 ascent
     if (baseline > cellH - 1) baseline = cellH - 1;
     if (baseline < 1) baseline = 1;
 
@@ -1067,9 +1198,11 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
 
         int adv;
         stbtt_GetGlyphHMetrics(&g_stb, g, &adv, nullptr);
+        // 步进按缩小后比例（等比: 字宽与字形一致; 槽位宽度 met+4 填 cellW）
         f->advances[idx] = adv > 0 ? (int)((float)adv * scale + 0.5f) : cellW;
         if (f->advances[idx] <= 0) f->advances[idx] = cellW / 2;
 
+        // 等比缩小后位图自然 <= cellW, 直接 blit（无需重采样）
         if (w > 0 && h > 0)
         {
             // 光栅化到临时再拷入 cell（裁剪到 cell 内）
@@ -1080,11 +1213,11 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
                 for (int row = 0; row < h; ++row)
                 {
                     int dy = oy + row;
-                    if (dy < 0 || dy >= cellH) continue;
+                    if (dy < 0 || dy >= (int)cellH) continue;
                     for (int col = 0; col < w; ++col)
                     {
                         int dx = ox + col;
-                        if (dx < 0 || dx >= cellW) continue;
+                        if (dx < 0 || dx >= (int)cellW) continue;
                         cell[dy * cellW + dx] = tmp[row * w + col];
                     }
                 }
@@ -1096,8 +1229,8 @@ static DWORD WINAPI RasterizeThread(LPVOID arg)
 
     if (offBase != (int)FONT_BASECHAR_DEFAULT)
         Log("font%u: warn official baseChar=%d != 0x20", fontId, offBase);
-    Log("font%u: rasterized %u cells (cellW=%u cellH=%u baseline=%d, missGlyph=%u, official count=%d)",
-        fontId, n, cellW, cellH, baseline, missGlyph, offCount);
+    Log("font%u: rasterized %u cells (cellW=%u cellH=%u glyphScale=%.2f baseline=%d, missGlyph=%u, official count=%d)",
+        fontId, n, cellW, cellH, (double)(scale / fullScale), baseline, missGlyph, offCount);
 
     InterlockedExchange(&f->state, 3);  // 待 D3D 阶段
 
@@ -2543,7 +2676,7 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7.5.0: subtitle-draw entry replace (Hook J, ali213 scheme) ====");
+    Log("==== SR3R_I18N v7.5.1: charlist merge + atlas capacity autoshrink ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
@@ -2589,6 +2722,15 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
         InterlockedExchange(&g_dictLoaded, 1);   // 字形层 charset 以词典收集为准
     else
         Log("dict: load failed/skipped, font-only mode (kernel text + builtin charset)");
+
+    // v7.5.1: charlist.txt 合并（内核汉化/官方 le_data 用字补全; 必须在 g_dictReady=1
+    //   与 FontFileThread 启动前完成, charset 在此后冻结; 词典缺字如"齿"由此补上）
+    if (g_cfg.charlistFile[0])
+    {
+        wchar_t clPath[MAX_PATH];
+        _snwprintf_s(clPath, MAX_PATH, _TRUNCATE, L"%ls\\%ls", dir, g_cfg.charlistFile);
+        LoadCharList(clPath);
+    }
 
     // 3. DumpText（ini 可关）
     if (g_cfg.dumpEnabled)
@@ -2645,7 +2787,7 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     CloseHandle(CreateThread(nullptr, 0, FontFileThread, hSelf, 0, nullptr));
 
     CloseHandle(CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr));
-    Log("v7.5 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d F=%d G=%d H=%d I=%d J=%d, idling",
+    Log("v7.5.1 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d F=%d G=%d H=%d I=%d J=%d, idling",
         g_dictCount, files, (int)a, (int)b, (int)c, (int)d, (int)e, (int)f, (int)g, (int)h, (int)i, (int)j);
     return 0;
 }
