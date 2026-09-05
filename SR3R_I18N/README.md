@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '9bb11a41-787c-4e80-bd77-8647fda7a7b1'
+  PropagateID: '9bb11a41-787c-4e80-bd77-8647fda7a7b1'
+  ReservedCode1: '4bc59b62-e6a9-4fd4-8500-db09a9cca016'
+  ReservedCode2: '4bc59b62-e6a9-4fd4-8500-db09a9cca016'
+---
+
 # SR3R_I18N — Saints Row The Third Remastered External Localization DLL
 
 外挂式运行时汉化 DLL：不动任何游戏资源文件，在内存中替换文本并注入中文字形渲染。
@@ -85,6 +96,9 @@ x64 game build; requires ASI Loader (bundled approach) or an equivalent injector
 dict_dir = dict                              ; 词典文件夹（相对 asi）/ dict folder (relative to the asi)
 font_file = SourceHanSansHWSC-VF.ttf         ; 中文字体文件名（相对 asi）/ CJK TTF file (relative to the asi)
 dump_enabled = 1                             ; 1=收集未命中文本 0=关闭 / collect untranslated text
+lang_early = 1                               ; v7.4 语言服务层整句替换 / language-service early swap
+subtitle_early = 1                           ; v7.5 字幕绘制入口整句替换（折行前）/ subtitle entry swap (before word-wrap)
+early_diag = 1                               ; 命中/miss 诊断日志 / hit/miss diagnostic logs
 ```
 
 词典加载失败或文件夹为空时，DLL 进入 idle 模式：只打日志，不装任何 hook。
@@ -98,6 +112,8 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
 文本层 / Text layer
   Hook A  DrawWide     (sub_1408B5FF0)  R9=text ptr  -> dictionary swap
   Hook B  Format       (sub_140812610)  RDX=fmt ptr  -> dictionary swap
+  Hook J  Subtitle     (sub_1402D2BC0)  RCX=text ptr -> dictionary swap BEFORE engine word-wrap
+  Hook F/G LangCur/LangTxt (sub_140812060/040)  -> early full-sentence swap (language-service return layer)
 字形层 / Glyph layer (only when translated text contains CJK)
   Hook C  FontLookup   (sub_140859B10)  -> return fake font object per fontId
   Hook D  TexObj       (sub_14085DB30)  -> magic texId -> fake texture object (w/h)
@@ -189,6 +205,14 @@ If the dictionary folder is missing or empty, the DLL goes idle: it logs and ins
     - VS2017 v141 工具集、/MT、C++17；x64。
     - VS2017 v141 toolset, /MT, C++17; x64.
 
+12. **语音字幕链不走 Format，且尾部带时长控制码**（v7.5）/ **Voice subtitles bypass Format and carry a trailing duration code**
+    - 语音字幕文本经字符串表直出，不经 formatter，也不经过语言服务 —— 在其绘制入口（折行发生之前）替换才是唯一可靠落点；该函数返回值就是显示时长（秒）。
+    - Voice-subtitle text goes straight from the string table to the draw entry; it never passes the formatter or the language service. Replacing at the draw entry — before word-wrap — is the only reliable interception point; the function's return value *is* the display duration in seconds.
+    - 文本尾部可能有字面 `\n<毫秒>` 控制码（时长由引擎 `atoi/1000` 解析）：剥离后查词典、命中后拼回原尾码，时长语义才不变。
+    - The text may end with a literal `\n<milliseconds>` duration code (parsed by the engine as `atoi/1000`): strip it before the dictionary lookup, append the original tail back after the swap — otherwise subtitle timing changes.
+    - 佐证：游侠汉化同样 hook 此函数入口（SIG3），词典 17411 条 KEY 全是英文整句 —— 折行残段问题在入口整串替换架构下天然不存在。
+    - Corroboration: the ali213 patch hooks this same entry (SIG3) with 17,411 full-sentence keys — wrap-fragment misses simply cannot exist under entry-point whole-string replacement.
+
 ---
 
 ## 性能与显存 / Performance & VRAM
@@ -216,8 +240,8 @@ font0: upgrade requested (first CJK text)
 font0: rasterized 2287 cells (...)
 font0: src atlas 2048x1024 fmt=BC3(76) ... RowPitch=8192
 font0: LIVE atlas=2048x13712 cells=2287 kept=2287
-v7 active: dict=... keys (96 files), hooks A=1 B=1 C=1 D=1 E=1, idling
-stats: draw hit=... miss=... | format hit=... miss=... | dumped=... | fonts=...
+v7.5 active: dict=... keys (... files), hooks A=1 B=1 C=1 D=1 E=1 F=1 G=1 H=1 I=1 J=1, idling
+stats: draw hit=... miss=... | format hit=... miss=... | wrap=... | sub hit=... miss=... | dumped=... | fonts=...
 ```
 
 排查速查 / Quick diagnosis:

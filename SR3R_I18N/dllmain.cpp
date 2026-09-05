@@ -31,6 +31,11 @@
 //                + CreateTexture2D/SRV + 组装伪对象（~15ms）
 //   9. 官方图集原样 blit 保留 -> 未翻译内容(Credits 等)渲染不变
 //
+//  [字幕注入 v7.5]（Hook J: sub_1402D2BC0 字幕/HUD 绘制入口, 游侠方案同点位）
+//   引擎在此函数内部对文本折行(sub_14085A1F0)后逐行绘制 —— 入口整串替换为
+//   中文整句, 引擎按 CJK 宽度自然折行, 从根上消除"折行残段查词典 miss"。
+//   （v7.3 状态机在 Format 层的折行后拼接仅作 UI 文本兜底, 与本 hook 互补）
+//
 // 安全性:
 //   - 伪对象不在 fontTab, 引擎卸载(sub_14085A250)遍历不到, 无双重释放
 //   - HookFontLookup 校验 fontTab[slot]==构建时官方指针, 引擎若重建字体自动回退
@@ -38,6 +43,7 @@
 //   - hook 安装前比对目标入口 16 字节特征, 防游戏更新后错位
 
 #include "pch.h"
+#include <intrin.h>          // _ReturnAddress (v7.4 Format 调用点分类诊断)
 #include <MinHook.h>
 #include <d3d11.h>
 
@@ -65,6 +71,47 @@ static const uint8_t SIG_TEXOBJ[16] = {
 static const uint8_t SIG_SRV_RESOLVE[16] = {
     0x48,0x83,0xEC,0x28,0x4C,0x63,0xC1,0x44,0x0F,0xB6,0xD2,0x41,0x83,0xF8,0xFF,0x0F };
 
+// v7.4 早期整句替换（引擎原生支持日/韩 => CJK 布局/切行管线现成, 让引擎自己切中文行）
+//   语言服务对象 qword_142906D28 的 vtable[0]/[1] 被两个 9 指令 thunk 尾调:
+//     sub_140812040: mov rax,[qword_142906D28]; test rax,rax; jz +0B; mov rdx,[rax];
+//                    test rdx,rdx; jz +3; jmp rdx; ret0          -> vtable[0]() 当前解析文本
+//     sub_140812060: 同上但 mov rdx,[rax+8]; jz +0C              -> vtable[1]() 当前文本
+//   文本对象刷新 sub_14082DD10 优先取 vtable[1]() 的返回串当 Format 的 fmt:
+//   在此返回层把英文完整句替换为中文整句, Format 之后由布局引擎 sub_140834C30
+//   按 CJK 字形宽度自切行 —— 无需再赌 wrap-rejoin 状态机。
+//   （IDA 2026-09-06 实测字节; jz 偏移两 thunk 不同, 因 [rax] vs [rax+8] 长度差）
+static constexpr uint64_t VA_LANG_CUR = 0x140812060ULL;   // vtable[1] "当前文本"
+static constexpr uint64_t VA_LANG_TXT = 0x140812040ULL;   // vtable[0] "当前解析文本"
+static const uint8_t SIG_LANG_CUR[16] = {
+    0x48,0x8B,0x05,0xC1,0x4C,0x0F,0x02,0x48,0x85,0xC0,0x74,0x0C,0x48,0x8B,0x50,0x08 };
+static const uint8_t SIG_LANG_TXT[16] = {
+    0x48,0x8B,0x05,0xE1,0x4C,0x0F,0x02,0x48,0x85,0xC0,0x74,0x0B,0x48,0x8B,0x10,0x48 };
+
+// v7.4.3 诊断 hook H: 文本对象 SetText (sub_14082EA00, 文本子系统对象方法区)
+//   char SetText(obj, TextDesc* desc);  desc: [0]=tag, [8]=文本指针(char*)
+//   tag2=清空(释放模板 a1[0x128]); tag4/9=设置: a1+0x124=sub_140812240(文本)(行段不在
+//   语言表=>0), 模板 a1+0x128=文本副本, a1+0x14C|=2 标脏 -> 下帧刷新 Format(模板)。
+//   意图: 抓字幕播放器真实 SetText 序列(完整句 or 行段? 行序?) 决定早期替换落点。
+static constexpr uint64_t VA_SET_TEXT = 0x14082EA00ULL;   // SetText(obj, desc)
+static const uint8_t SIG_SET_TEXT[16] = {
+    0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x8B };
+
+// v7.4.4 诊断 hook I: 文本对象刷新 (sub_14082DD10, vtable 槽 0x1436782D8)
+//   每帧被全局刷新器对文本对象调用; 内部: 标脏才 Format(模板/当前文本) -> 布局 sub_140834C30。
+//   obj+0x124=dword hash, obj+0x128=模板窄串(char*)。无论模板谁写入(SetText/直接拷贝),
+//   刷新层都能看到模板内容与变化时机。签名取函数头 16 字节。
+static constexpr uint64_t VA_TEXTOBJ_REFRESH = 0x14082DD10ULL;   // RefreshText(obj)
+static const uint8_t SIG_TEXTOBJ_REFRESH[16] = {
+    0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,0x89,0x7C,0x24,0x20,0x55 };
+
+// v7.5 字幕/HUD 绘制入口整串替换（游侠 ali213 SIG3 同点位; IDA 2026-09-06 实测）
+//   sub_1402D2BC0(text, a2, a3, a4): a1=宽字符串, 内部 sub_14085A1F0 折行布局后
+//   逐行绘制; a3<=0.1 时从尾部字面 \n<毫秒> 解析显示时长(atoi/1000), 否则 2s。
+//   特征码前 16 字节在 SRTTR.exe 全映像唯一（已验证）。
+static constexpr uint64_t VA_SUBTITLE_DRAW = 0x1402D2BC0ULL;
+static const uint8_t SIG_SUBTITLE_DRAW[16] = {
+    0x4C,0x8B,0xDC,0x55,0x57,0x41,0x54,0x49,0x8D,0xAB,0xA8,0xFB,0xFF,0xFF,0x48,0x81 };
+
 // 引擎全局（VA）
 static constexpr uint64_t VA_FONTTAB     = 0x142998168ULL;  // 字体对象指针表
 static constexpr uint64_t VA_FONTCOUNT   = 0x142998160ULL;  // 字体数
@@ -91,6 +138,7 @@ static constexpr uint64_t WRAP_TTL_MS     = 5000;  // 残段缓存过期（防�
 static constexpr size_t   WRAP_MIN_PREFIX = 8;     // 前缀残段最短长度（过滤短 UI 串噪音）
 static constexpr size_t   WRAP_MIN_SUFFIX = 2;     // 后缀残段最短长度
 // ---------- VA -> 本进程地址 ----------
+static uint64_t s_exeBase = 0;   // 游戏模块实际基址（MainThread 内 GetModuleHandleW(nullptr); 诊断分类用）
 template <typename T = uint8_t*>
 static inline T VA(uint64_t va)
 {
@@ -135,6 +183,9 @@ struct Config
     wchar_t originDir[MAX_PATH];  // 联表文件夹（ID/HASH_ -> 英文原文; 相对 asi 目录）
     wchar_t fontFile[MAX_PATH];   // 字体 TTF 文件名（相对 asi 目录）
     bool     dumpEnabled;         // 未命中文本收集（DumpText.dtxt）
+    bool     langEarly;           // v7.4: 语言服务返回层整句替换（引擎自切行）
+    bool     earlyDiag;           // v7.4: 早期替换命中/Format miss 调用点诊断日志
+    bool     subtitleEarly;       // v7.5: 字幕绘制入口整串替换（Hook J）
 };
 
 static Config g_cfg = {
@@ -142,6 +193,9 @@ static Config g_cfg = {
     L"origin",                     // 默认: scripts/origin/
     L"SourceHanSansHWSC-VF.ttf",   // 默认字体
     true,
+    true,                          // lang_early
+    true,                          // early_diag
+    true,                          // subtitle_early
 };
 
 // UTF-8 无 BOM/带 BOM ini 行解析（手工实现, 避免路径中文问题）
@@ -194,12 +248,16 @@ static void LoadConfig(const wchar_t* iniPath)
         else if (_wcsicmp(key, L"origin_dir") == 0)  wcscpy_s(g_cfg.originDir, val);
         else if (_wcsicmp(key, L"font_file") == 0)   wcscpy_s(g_cfg.fontFile, val);
         else if (_wcsicmp(key, L"dump_enabled") == 0) g_cfg.dumpEnabled = (*val != L'0');
+        else if (_wcsicmp(key, L"lang_early") == 0)  g_cfg.langEarly  = (*val != L'0');
+        else if (_wcsicmp(key, L"early_diag") == 0)  g_cfg.earlyDiag  = (*val != L'0');
+        else if (_wcsicmp(key, L"subtitle_early") == 0) g_cfg.subtitleEarly = (*val != L'0');
 
         line = wcstok_s(nullptr, L"\r\n", &ctx);
     }
     VirtualFree(wbuf, 0, MEM_RELEASE);
-    Log("cfg: %ls loaded (dict_dir=%ls origin_dir=%ls font_file=%ls dump=%d)",
-        iniPath, g_cfg.dictDir, g_cfg.originDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled);
+    Log("cfg: %ls loaded (dict_dir=%ls origin_dir=%ls font_file=%ls dump=%d early=%d diag=%d sub=%d)",
+        iniPath, g_cfg.dictDir, g_cfg.originDir, g_cfg.fontFile, (int)g_cfg.dumpEnabled,
+        (int)g_cfg.langEarly, (int)g_cfg.earlyDiag, (int)g_cfg.subtitleEarly);
 }
 
 // ---------- CRC-32 (IEEE 反射, 与 zlib.crc32 一致) ----------
@@ -533,6 +591,26 @@ struct WrapState
 
 static WrapState g_wrap;
 
+// v7.4.2 wrap 状态诊断: 关键迁移频控日志 + 计数器（实证"段2 是否到达/被顶/TTL 过期/拼接失败"）
+enum { WD_LEARN = 0, WD_TTLEXP, WD_CONCAT, WD_REPLACE, WD_STABLE, WD_TOKEOVER, WD_N };
+static volatile LONG g_wrapCnt[WD_N];           // 事件计数
+static uint64_t      g_wrapDiagTick[WD_N];      // 频控时间戳
+static void WrapDiag(int ev, uint64_t now, const wchar_t* a, const wchar_t* b)
+{
+    InterlockedIncrement(&g_wrapCnt[ev]);
+    if (now - g_wrapDiagTick[ev] < 3000) return;   // 每事件类型 3s 最多 1 条
+    g_wrapDiagTick[ev] = now;
+    switch (ev)
+    {
+    case WD_LEARN:    Log("wrap: LEARN  pend=\"%.60ls\"", a); break;
+    case WD_TTLEXP:   Log("wrap: TTL-EXPIRED  pend=\"%.60ls\"", a); break;
+    case WD_CONCAT:   Log("wrap: CONCAT-MISS  pre=\"%.44ls\" | suf=\"%.24ls\"", a, b); break;
+    case WD_REPLACE:  Log("wrap: REPLACE-pend (新 prefix 顶掉旧段1)  old=\"%.36ls\" new=\"%.36ls\"", a, b); break;
+    case WD_STABLE:   Log("wrap: STABLE full=\"%.48ls\" -> \"%.32ls\"", a, b); break;
+    case WD_TOKEOVER: Log("wrap: STABLE takeover -> \"%.48ls\"", a); break;
+    }
+}
+
 // STABLE 两行译文（命中时预计算好, 渲染线程直接返回指针）
 static wchar_t g_half1[WRAP_MAX_CHARS + 1];
 static wchar_t g_half2[WRAP_MAX_CHARS + 1];
@@ -632,6 +710,7 @@ static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
     // 暂定段1 过期清理（STABLE/LEARN 共用; 防陈旧 pend 与后续无关文本误拼接）
     if (g_wrap.pendLen && now - g_wrap.pendTick > WRAP_TTL_MS)
     {
+        WrapDiag(WD_TTLEXP, now, g_wrap.pend, nullptr);
         g_wrap.pendLen = 0;
         if (g_wrap.mode == WRAP_LEARN) g_wrap.mode = WRAP_IDLE;
     }
@@ -689,6 +768,7 @@ static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
                 wmemcpy(g_half2, r->trans + cut, tlen - cut);
                 g_half2[tlen - cut] = L'\0';
                 InterlockedIncrement(&g_wrapHits);
+                WrapDiag(WD_TOKEOVER, now, cand, nullptr);
 
                 // 静默吸收: 本帧段2不显示（前缀行本帧已显示英文, 下一帧起换译文前半）
                 return nullptr;
@@ -742,10 +822,13 @@ static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
                 wmemcpy(g_half2, r->trans + cut, tlen - cut);
                 g_half2[tlen - cut] = L'\0';
                 InterlockedIncrement(&g_wrapHits);
+                WrapDiag(WD_STABLE, now, cand, r->trans);
 
                 // 静默吸收: 本帧段2不显示（前缀行本帧已显示英文, 下一帧起换译文前半）
                 return nullptr;
             }
+            // v7.4.2: 拼接尝试但未命中 —— 记录段1/段2 形态, 实证断行点/空格差异
+            WrapDiag(WD_CONCAT, now, g_wrap.pend, s);
         }
 
         // 另一疑似段1（换句/别的 HUD 文本也以词中字符结尾）: 滚动替换缓存。
@@ -753,6 +836,7 @@ static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
         // 后缀段将永远无法与段1 配对（IDLE->LEARN->IDLE 抖动, 永远拼不上）。
         if (WrapLooksLikePrefix(s, len))
         {
+            WrapDiag(WD_REPLACE, now, g_wrap.pend, s);
             wmemcpy(g_wrap.pend, s, len);
             g_wrap.pend[len] = L'\0';
             g_wrap.pendLen   = len;
@@ -765,6 +849,7 @@ static const wchar_t* WrapProcess(const wchar_t* s, size_t len)
     // ---------- IDLE: 学习疑似段1（够长 + 尾字符是词中字符） ----------
     if (g_wrap.mode == WRAP_IDLE && WrapLooksLikePrefix(s, len))
     {
+        WrapDiag(WD_LEARN, now, s, nullptr);
         wmemcpy(g_wrap.pend, s, len);
         g_wrap.pend[len] = L'\0';
         g_wrap.pendLen   = len;
@@ -1696,6 +1781,8 @@ static DWORD WINAPI FontFileThread(LPVOID hSelf)
 // 文本层 Hook A/B（v5）
 // =====================================================================
 
+static void DiagFmtOrigin(uint64_t raCaller, const wchar_t* s);   // v7.4 前向声明
+
 using DrawWide_t = __int64(__fastcall*)(void*, float, float, const wchar_t*, float, char, unsigned int, void*);
 static DrawWide_t g_origDrawWide = nullptr;
 
@@ -1718,6 +1805,9 @@ static Format_t g_origFormat = nullptr;
 static __int64 __fastcall HookFormat(wchar_t* dst, const wchar_t* fmt,
                                       unsigned long long cap, void* args, unsigned int argc)
 {
+    // 必须先捕获: _ReturnAddress() 在函数入口 = Format 真正调用者的返回地址
+    // （任何后续 call 都会覆盖它 -> 归因必须用此刻的值）
+    uint64_t raCaller = reinterpret_cast<uint64_t>(_ReturnAddress());
     if (fmt && *fmt)
     {
         const DictNode* r = LookupNode(fmt, &g_hitB, &g_missB);
@@ -1730,9 +1820,372 @@ static __int64 __fastcall HookFormat(wchar_t* dst, const wchar_t* fmt,
             // 整句/trim 均未命中: 走折行重组（含 % 的模板串与内嵌换行的完整文本不参与）
             const wchar_t* w = WrapProcess(fmt, wcslen(fmt));
             if (w) fmt = w;
+            // v7.4 诊断: 仍未替换的英文长文本 -> 按返回地址归类（谁在把行段/长句喂给 Format）
+            else if (g_cfg.earlyDiag) DiagFmtOrigin(raCaller, fmt);
         }
     }
     return g_origFormat(dst, fmt, cap, args, argc);
+}
+
+// =====================================================================
+// v7.4 早期整句替换（语言服务返回层; 引擎布局自切行, 游戏原生支持日/韩）
+//   文本对象刷新 sub_14082DD10 优先用 vtable[1]()(sub_140812060) 的返回串当 Format
+//   的 fmt; vtable[0]()(sub_140812040) 供 Lua action 等取本地化文本。这两个 thunk
+//   都只读全局语言服务对象并尾调其 vtable 槽, 是"完整句"在切行/展开前的最下游载体:
+//   在此返回层把命中词典的英文完整句替换为中文整句, 引擎 Format 后由布局引擎
+//   sub_140834C30 按 CJK 宽度自切行（wrap-rejoin 状态机仅作兜底）。
+//   仅替换返回值、不改引擎内存; 译文在 arena 内永久有效。
+// 调用点分类（诊断用; 渲染/UI 线程, 原子计数即可, 不逐条打日志防刷屏）。
+// v7.4.2: raCaller 在 HookFormat 入口用 _ReturnAddress() 捕获（= Format 真正调用者返回地址）,
+// 窗口匹配 [call, call+12) 覆盖 call rel32/rip/mem 不同长度; 常量本身是 call 指令地址。
+static constexpr uint64_t RA_FMT_WRAPPER = 0x18E7E0ULL;  // char* 通用包装 -> Format
+static constexpr uint64_t RA_FMT_CRIB     = 0x212035ULL;  // Crib 初始化（与字幕无关, 排除）
+static constexpr uint64_t RA_FMT_LUA      = 0x81CB55ULL;  // Lua action: 本地化文本 -> Format
+static constexpr uint64_t RA_FMT_TEXTCUR  = 0x82DDBDULL;  // 文本对象刷新: fmt = 语言服务"当前文本"
+static constexpr uint64_t RA_FMT_TEXTTMPL = 0x82DE22ULL;  // 文本对象刷新: fmt = 对象模板 a1[37]
+static volatile LONG g_fmtFrom[8];   // 分类计数（RA_FMT_* 顺序, idx0=其他/未知）
+
+static volatile LONG g_earlyCurHit = 0, g_earlyCurMiss = 0;   // vtable[1] 当前文本
+static volatile LONG g_earlyTxtHit = 0, g_earlyTxtMiss = 0;   // vtable[0] 当前解析文本
+
+// v7.4.1: sub_140812060/040 是"隐式传参转发器"——调用者把 hash/描述块放进 rcx
+// 再尾调语言服务槽位(IDA 无参声明是假象)。hook 必须原样透传 a1..a4, 否则槽位
+// 收到垃圾参数返回 NULL, 文本对象刷新会 fallback 到 a1[37] 原始 KEY 模板(全 UI 变 KEY)。
+using LangGet_t = const wchar_t* (__fastcall*)(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
+static LangGet_t g_origLangCur = nullptr;   // sub_140812060
+static LangGet_t g_origLangTxt = nullptr;   // sub_140812040
+
+// 调用点分类（诊断用; 渲染/UI 线程, 原子计数即可, 不逐条打日志防刷屏）
+static void DiagFmtOrigin(uint64_t raCaller, const wchar_t* s)
+{
+    size_t n = wcslen(s);
+    if (n < 24) return;                        // 短文本(常量/HUD 数字)不归因
+    bool hasCjk = false;
+    for (const wchar_t* p = s; *p; ++p) if (*p >= 0x80) { hasCjk = true; break; }
+    if (hasCjk) return;                        // 已是中文/他语文本, 无需归因
+    uint64_t ra = raCaller - s_exeBase;
+    int idx = 0;                               // 0 = 其他
+    if      (ra >= RA_FMT_WRAPPER && ra < RA_FMT_WRAPPER + 12) idx = 1;
+    else if (ra >= RA_FMT_CRIB     && ra < RA_FMT_CRIB     + 12) idx = 2;
+    else if (ra >= RA_FMT_LUA      && ra < RA_FMT_LUA      + 12) idx = 3;
+    else if (ra >= RA_FMT_TEXTCUR  && ra < RA_FMT_TEXTCUR  + 12) idx = 4;
+    else if (ra >= RA_FMT_TEXTTMPL && ra < RA_FMT_TEXTTMPL + 12) idx = 5;
+    InterlockedIncrement(&g_fmtFrom[idx]);
+}
+
+// 返回层整句替换共享逻辑。约定:
+//   - 词典未就绪(g_dictReady=0)或空串: 原样
+//   - 含 % / \n: 模板或显式多行, 交给 Format hook / 引擎, 不提前拦
+//   - 长度 <4(图标/占位) 或 >= WRAP_MAX_CHARS(超长): 原样
+//   命中: 返回译文(中文整句, 引擎布局自行按 CJK 切行); miss: 返回原文。
+static const wchar_t* EarlySub(LangGet_t orig,
+                               uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                               volatile LONG* hit, volatile LONG* miss)
+{
+    const wchar_t* s = orig(a1, a2, a3, a4);   // 完整透传调用者参数, 不破坏槽位语义
+    if (!s || !*s || !g_dictReady) return s;
+    if (wcschr(s, L'%') || wcschr(s, L'\n')) return s;
+    size_t n = wcslen(s);
+    if (n < 4 || n >= WRAP_MAX_CHARS) return s;
+    const DictNode* r = DictLookup(s, n);
+    if (r)
+    {
+        InterlockedIncrement(hit);
+        if (g_cfg.earlyDiag)
+        {
+            static volatile LONG dbg = 0;
+            if (InterlockedIncrement(&dbg) <= 8)
+                Log("early: HIT  len=%zu  \"%.48ls\" -> \"%.48ls\"", n, s, r->trans);
+        }
+        return r->trans;
+    }
+    InterlockedIncrement(miss);
+    if (g_cfg.earlyDiag)
+    {
+        static volatile LONG dbg = 0;
+        bool asciiWordy = false;
+        for (const wchar_t* p = s; *p; ++p)
+            if (*p == L' ' && *(p + 1) >= L'a' && *(p + 1) <= L'z') { asciiWordy = true; break; }
+        if (asciiWordy && InterlockedIncrement(&dbg) <= 6)
+            Log("early: miss len=%zu  \"%.48ls\"", n, s);
+    }
+    return s;
+}
+
+static const wchar_t* __fastcall HookLangCur(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+    return EarlySub(g_origLangCur, a1, a2, a3, a4, &g_earlyCurHit, &g_earlyCurMiss);
+}
+
+static const wchar_t* __fastcall HookLangTxt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+    return EarlySub(g_origLangTxt, a1, a2, a3, a4, &g_earlyTxtHit, &g_earlyTxtMiss);
+}
+
+// ---------- v7.4.4 诊断 hook H: SetText 探针（全 tag） ----------
+using SetText_t = char(__fastcall*)(uint64_t obj, const uint8_t* desc);
+static SetText_t g_origSetText = nullptr;   // sub_14082EA00
+static volatile LONG64 g_setTextDiag = 0;   // 探针日志条数
+static uint64_t       g_setTextTick  = 0;   // 频控时间戳
+static volatile LONG  g_setTagCnt[16];      // tag 分布（探针所见 tag 计数, tag>=16 归 15）
+
+// desc 是 TextDesc*: [0]=tag(dword), [8]=文本指针。tag4/9: 模板写入(char* UTF-8)。
+//   tag2 = 清空对象模板（字幕切句/复用的时序信号）。
+//   其他 tag 未知: desc[8] 可能是 char* 或 wchar_t* —— 双解析打印。
+//   只读探针: 不改对象/desc, 抓字幕播放器 SetText 的真实序列与 tag。
+static char __fastcall HookSetText(uint64_t obj, const uint8_t* desc)
+{
+    if (desc)
+    {
+        uint32_t tag = *reinterpret_cast<const uint32_t*>(desc);
+        InterlockedIncrement(&g_setTagCnt[(tag < 15) ? tag : 15]);
+        uint64_t now = GetTickCount64();
+        LONG64 c = InterlockedIncrement64(&g_setTextDiag);
+        // tag2(清空) 低频: 400ms 频控即可; 其余前 120 条全记, 之后 150ms 频控
+        bool logIt = (tag == 2) ? (now - g_setTextTick > 400)
+                                : (c <= 120 || now - g_setTextTick > 150);
+        if (logIt)
+        {
+            g_setTextTick = now;
+            const char* txt = *reinterpret_cast<const char* const*>(desc + 8);
+            wchar_t wbuf[160];
+            int wn = 0;
+            if (txt)
+            {
+                size_t n = strnlen(txt, 240);
+                if (n >= 1)
+                {
+                    wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                             txt, (int)((n < 140) ? n : 140), wbuf, 159);
+                    if (wn <= 0)   // 非 UTF-8: 可能是宽串(wchar_t*) 或 ANSI
+                    {
+                        const wchar_t* wt = reinterpret_cast<const wchar_t*>(txt);
+                        wn = 0;
+                        bool looksWide = false;
+                        for (size_t i = 0; i < 140 && wt[i]; ++i)
+                        {
+                            wchar_t ch = wt[i];
+                            if (ch >= 0xD800 && ch <= 0xDFFF) break;   // 代理区: 非文本
+                            if (ch < 0x20 && ch != L'\n' && ch != L'\t' && ch != L'\r') break;
+                            if (ch == 0) break;
+                            wbuf[wn++] = ch;
+                            looksWide = true;
+                        }
+                        if (!looksWide)   // 兜底: ASCII 可打印段
+                        {
+                            wn = 0;
+                            for (size_t i = 0; i < n && i < 140; ++i)
+                            {
+                                unsigned ch = (unsigned char)txt[i];
+                                if (ch < 0x20 || ch >= 0x7F) break;
+                                wbuf[wn++] = (wchar_t)ch;
+                            }
+                        }
+                    }
+                }
+            }
+            if (wn > 0)
+            {
+                wbuf[wn] = L'\0';
+                Log("setText: obj=%08llX tag=%u len=%u \"%.100ls\"",
+                    (unsigned long long)obj, tag, (unsigned)wn, wbuf);
+            }
+            else
+            {
+                Log("setText: obj=%08llX tag=%u CLEAR/EMPTY", (unsigned long long)obj, tag);
+            }
+        }
+    }
+    return g_origSetText(obj, desc);
+}
+
+// ---------- v7.4.4 诊断 hook I: 文本对象刷新探针 (sub_14082DD10) ----------
+// 每帧被全局刷新器对文本对象调用(obj=this)。obj+0x128=模板窄串(char* UTF-8)。
+// 只关注"句子样"长文本(含小写字母且 >=16 字符, 无 [image: HUD 噪音):
+//   内容变化即报(字幕切句/倒计时), 内容稳定 5s 报一次(证明对象每帧进刷新)。
+using RefreshObj_t = void(__fastcall*)(uint64_t obj);
+static RefreshObj_t g_origRefresh = nullptr;   // sub_14082DD10
+static volatile LONG g_refreshSeen = 0;        // 入口调用总量
+static volatile LONG g_refreshLog  = 0;        // 实际日志条数
+
+static uint32_t Fnv1a32(const char* s, size_t n)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; ++i) { h = (h ^ (unsigned char)s[i]) * 16777619u; }
+    return h;
+}
+
+struct RefreshSlotT { volatile LONG objLo, crc; volatile uint64_t tick; };
+static RefreshSlotT g_refSlot[8];
+
+static void __fastcall HookRefresh(uint64_t obj)
+{
+    InterlockedIncrement(&g_refreshSeen);
+    if (obj)
+    {
+        const char* tmpl = *reinterpret_cast<const char* const*>(obj + 0x128);
+        if (tmpl)
+        {
+            size_t n = strnlen(tmpl, 200);
+            if (n >= 16)
+            {
+                bool sent = false, hasImg = false;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    char c = tmpl[i];
+                    if (c == '[') { hasImg = true; break; }
+                    if (c >= 'a' && c <= 'z') sent = true;
+                }
+                if (sent && !hasImg)
+                {
+                    uint32_t crc = Fnv1a32(tmpl, n);
+                    uint32_t objLo = (uint32_t)obj;
+                    uint64_t now = GetTickCount64();
+                    int slot = -1, free = -1, oldest = 0;
+                    for (int i = 0; i < 8; ++i)
+                    {
+                        if (g_refSlot[i].objLo == (LONG)objLo) { slot = i; break; }
+                        if (!g_refSlot[i].objLo && free < 0) free = i;
+                        if (g_refSlot[i].tick < g_refSlot[oldest].tick) oldest = i;
+                    }
+                    bool logIt = false;
+                    if (slot >= 0)
+                    {
+                        if (g_refSlot[slot].crc != (LONG)crc) logIt = true;              // 内容变化
+                        else if (now - g_refSlot[slot].tick > 5000) logIt = true;        // 稳定刷新 5s 报一次
+                        if (logIt) { g_refSlot[slot].crc = (LONG)crc; g_refSlot[slot].tick = now; }
+                    }
+                    else
+                    {
+                        int use = (free >= 0) ? free : oldest;
+                        g_refSlot[use].objLo = (LONG)objLo;
+                        g_refSlot[use].crc = (LONG)crc;
+                        g_refSlot[use].tick = now;
+                        logIt = true;
+                    }
+                    if (logIt && InterlockedIncrement(&g_refreshLog) <= 500)
+                    {
+                        wchar_t wbuf[140]; int wn = 0;
+                        wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, tmpl,
+                                                 (int)((n < 120) ? n : 120), wbuf, 139);
+                        if (wn <= 0)
+                        {
+                            wn = 0;
+                            for (size_t i = 0; i < n && i < 120; ++i)
+                            {
+                                unsigned ch = (unsigned char)tmpl[i];
+                                if (ch < 0x20 || ch >= 0x7F) break;
+                                wbuf[wn++] = (wchar_t)ch;
+                            }
+                        }
+                        if (wn > 0)
+                        {
+                            wbuf[wn] = L'\0';
+                            Log("refresh: obj=%08llX n=%u \"%.90ls\"",
+                                (unsigned long long)obj, (unsigned)n, wbuf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (g_origRefresh) g_origRefresh(obj);
+}
+
+// =====================================================================
+// v7.5 Hook J: 字幕/HUD 绘制入口整串替换 (sub_1402D2BC0, 游侠 SIG3 同点位)
+// =====================================================================
+// 逆向结论（IDA 2026-09-06, SRTTR.exe）:
+//   double sub_1402D2BC0(wchar_t* text, float a2, double a3, int a4)
+//   - a1 直接当宽字符串逐字符扫描; 返回值 = 显示时长(秒)
+//   - 折行发生在函数内部: sub_14085A1F0(text, maxW, 64, ...) 按字幕框宽度布局
+//     出行起止数组后逐行绘制 —— 折行前整串替换为中文, 引擎按 CJK 宽度自然折行,
+//     完整句 KEY 直接命中, 从根上消除"折行残段查词典 miss"
+//   - a3<=0.1 时从 text 尾部字面 \n<毫秒> 控制码解析时长(atoi/1000), 否则默认 2s
+//   - 5 个调用者覆盖字幕与 HUD 文本显示（游侠同点位广撒网, 实测无副作用）
+// 与其他 hook 的关系:
+//   - 字幕链不经 Format（文本经 sub_1403FD180 字符串表直出）, F/G 语言服务层
+//     收不到语音字幕 —— 本 hook 是该链路唯一替换点
+//   - 文本若已在 Format 层(Hook B)替换为中文, 本层查词典 miss 原样放行, 无双重替换
+//   - 字形升级无需在此触发: 字幕绘制链必经 FontLookup(Hook C) 公共点, 自动覆盖
+using SubtitleDraw_t = double(__fastcall*)(const wchar_t*, float, double, int);
+static SubtitleDraw_t g_origSubtitle = nullptr;
+static volatile LONG g_hitJ = 0, g_missJ = 0;
+
+// 译文输出缓冲（渲染线程专用, 与 g_wrap 状态机同线程假设, 无锁）
+static constexpr size_t SUBBUF_CHARS = WRAP_MAX_CHARS + 32;
+static wchar_t g_subBuf[SUBBUF_CHARS];
+
+// 尾部字面 \n<数字> 时长尾码检测: 返回主体长度（尾码起点）; 无尾码返回 len
+static size_t SubBodyLen(const wchar_t* s, size_t len)
+{
+    if (len < 4) return len;                      // 至少 \n + 1 数字 + 1 主体字符
+    size_t e = len;
+    while (e > 0 && s[e - 1] >= L'0' && s[e - 1] <= L'9') --e;
+    if (e == len || e < 2) return len;            // 尾部无数字 / 前面放不下 \n
+    if (s[e - 1] != L'n' || s[e - 2] != L'\\') return len;
+    return e - 2;                                 // 主体 [0, e-2)
+}
+
+static double __fastcall HookSubtitle(const wchar_t* text, float a2, double a3, int a4)
+{
+    if (text && *text && g_dictReady && !wcschr(text, L'%'))
+    {
+        size_t len = wcslen(text);
+        if (len < WRAP_MAX_CHARS)
+        {
+            size_t bodyLen = SubBodyLen(text, len);
+
+            // 查词典: 有尾码 -> 按主体查（词典 9630 KEY 实测零尾码, 整串查只会 miss）;
+            //          无尾码 -> 整串查。trim/规范化/miss-dump 由 LookupNode 统一处理。
+            // （未来若词典加入含尾码 KEY, 仍走主体查询 + 原尾码回填, 语义自洽不重复追加）
+            const DictNode* r;
+            size_t hitLen;
+            if (bodyLen < len)
+            {
+                wchar_t body[WRAP_MAX_CHARS];
+                wmemcpy(body, text, bodyLen);
+                body[bodyLen] = L'\0';
+                r = LookupNode(body, &g_hitJ, &g_missJ);
+                hitLen = bodyLen;
+            }
+            else
+            {
+                r = LookupNode(text, &g_hitJ, &g_missJ);
+                hitLen = len;
+            }
+            if (r)
+            {
+                size_t tn = wcslen(r->trans);
+                size_t tailLen = len - hitLen;
+                if (tn + tailLen + 1 <= SUBBUF_CHARS)
+                {
+                    // 译文 + 原尾码重组（保留尾码 => 引擎 a3<=0.1 时时长语义不变）
+                    wmemcpy(g_subBuf, r->trans, tn);
+                    wmemcpy(g_subBuf + tn, text + bodyLen, tailLen);
+                    g_subBuf[tn + tailLen] = L'\0';
+                    if (g_cfg.earlyDiag)
+                    {
+                        static volatile LONG dbg = 0;
+                        if (InterlockedIncrement(&dbg) <= 8)
+                            Log("sub: HIT len=%zu \"%.48ls\" -> \"%.48ls\"", len, text, g_subBuf);
+                    }
+                    return g_origSubtitle(g_subBuf, a2, a3, a4);
+                }
+            }
+            else if (g_cfg.earlyDiag)
+            {
+                static volatile LONG dbg = 0;
+                bool asciiWordy = false;
+                for (size_t i = 0; i + 1 < len; ++i)
+                    if (text[i] == L' ' && text[i + 1] >= L'a' && text[i + 1] <= L'z')
+                        { asciiWordy = true; break; }
+                if (asciiWordy && InterlockedIncrement(&dbg) <= 6)
+                    Log("sub: miss len=%zu \"%.64ls\"", len, text);
+            }
+        }
+    }
+    return g_origSubtitle(text, a2, a3, a4);
 }
 
 // ---------- txt 词典加载（le_strings 格式: "KEY": "VALUE", KEY=英文原文/槽位名） ----------
@@ -2039,8 +2492,20 @@ static DWORD WINAPI StatsThread(LPVOID)
     for (;;)
     {
         Sleep(STATS_PERIOD_MS);
-        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | wrap=%ld | dumped=%u | fonts=%ld",
-            g_hitA, g_missA, g_hitB, g_missB, g_wrapHits, g_dumpCount, g_fidCacheN);
+        Log("stats: draw hit=%ld miss=%ld | format hit=%ld miss=%ld | wrap=%ld | sub hit=%ld miss=%ld | dumped=%u | fonts=%ld",
+            g_hitA, g_missA, g_hitB, g_missB, g_wrapHits, g_hitJ, g_missJ, g_dumpCount, g_fidCacheN);
+        Log("stats: early cur=%ld/%ld txt=%ld/%ld | fmtFrom[other/wrap/crib/lua/textCur/tmpl]=%ld/%ld/%ld/%ld/%ld/%ld | setText=%I64d",
+            g_earlyCurHit, g_earlyCurMiss, g_earlyTxtHit, g_earlyTxtMiss,
+            g_fmtFrom[0], g_fmtFrom[1], g_fmtFrom[2], g_fmtFrom[3], g_fmtFrom[4], g_fmtFrom[5],
+            g_setTextDiag);
+        Log("stats: setTag[0..15]=%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld/%ld",
+            g_setTagCnt[0], g_setTagCnt[1], g_setTagCnt[2], g_setTagCnt[3], g_setTagCnt[4],
+            g_setTagCnt[5], g_setTagCnt[6], g_setTagCnt[7], g_setTagCnt[8], g_setTagCnt[9],
+            g_setTagCnt[10], g_setTagCnt[11], g_setTagCnt[12], g_setTagCnt[13], g_setTagCnt[14],
+            g_setTagCnt[15]);
+        Log("stats: refreshSeen=%ld refreshLog=%ld", g_refreshSeen, g_refreshLog);
+        Log("stats: wrapEv[learn/ttl/concat/replace/stable/takeover]=%ld/%ld/%ld/%ld/%ld/%ld",
+            g_wrapCnt[0], g_wrapCnt[1], g_wrapCnt[2], g_wrapCnt[3], g_wrapCnt[4], g_wrapCnt[5]);
         // 周期落盘 dump 收集（替代逐条 fflush, 防切界面卡顿; 崩溃最多丢本轮周期数据）
         if (g_dumpFile)
         {
@@ -2078,12 +2543,13 @@ static bool InstallHook(uint64_t va, const uint8_t* expect, const char* name,
 // ---------- 主线程 ----------
 static DWORD WINAPI MainThread(LPVOID hSelf)
 {
-    Log("==== SR3R_I18N v7.3.1: text replacement + CJK glyph layer (txt dict, wrap-rejoin, space-norm) ====");
+    Log("==== SR3R_I18N v7.5.0: subtitle-draw entry replace (Hook J, ali213 scheme) ====");
 
     wchar_t dir[MAX_PATH], iniPath[MAX_PATH], dictDir[MAX_PATH], dtxt[MAX_PATH];
     GetModuleFileNameW((HMODULE)hSelf, dir, MAX_PATH);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = L'\0'; else *dir = L'\0';
+    s_exeBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));   // v7.4 诊断 RA 换算用
 
     wcscpy_s(iniPath, dir); wcscat_s(iniPath, L"\\SR3R_I18N.ini");
     LoadConfig(iniPath);
@@ -2153,7 +2619,21 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     bool c = InstallHook(VA_FONT_LOOKUP, SIG_FONT_LOOKUP, "FontLookup", (void*)HookFontLookup, (void**)&g_origFontLookup);
     bool d = InstallHook(VA_TEXOBJ,      SIG_TEXOBJ,      "TexObj",     (void*)HookTexObj,     (void**)&g_origTexObj);
     bool e = InstallHook(VA_SRV_RESOLVE, SIG_SRV_RESOLVE, "SrvResolve", (void*)HookSrvResolve, (void**)&g_origSrvResolve);
-    if (!a && !b && !c && !d && !e)
+    // v7.4 早期整句替换（语言服务返回层; ini lang_early 可关）
+    bool f = g_cfg.langEarly && InstallHook(VA_LANG_CUR, SIG_LANG_CUR, "LangCur",
+                                            (void*)HookLangCur, (void**)&g_origLangCur);
+    bool g = g_cfg.langEarly && InstallHook(VA_LANG_TXT, SIG_LANG_TXT, "LangTxt",
+                                            (void*)HookLangTxt, (void**)&g_origLangTxt);
+    // v7.4.3 SetText 探针（随 lang_early; 纯诊断只读）
+    bool h = g_cfg.langEarly && InstallHook(VA_SET_TEXT, SIG_SET_TEXT, "SetText",
+                                            (void*)HookSetText, (void**)&g_origSetText);
+    // v7.4.4 文本对象刷新探针（随 lang_early; 纯诊断只读）
+    bool i = g_cfg.langEarly && InstallHook(VA_TEXTOBJ_REFRESH, SIG_TEXTOBJ_REFRESH, "Refresh",
+                                            (void*)HookRefresh, (void**)&g_origRefresh);
+    // v7.5 字幕/HUD 绘制入口整串替换（游侠方案同点位; ini subtitle_early 可关）
+    bool j = g_cfg.subtitleEarly && InstallHook(VA_SUBTITLE_DRAW, SIG_SUBTITLE_DRAW, "Subtitle",
+                                                (void*)HookSubtitle, (void**)&g_origSubtitle);
+    if (!a && !b && !c && !d && !e && !f && !g && !h && !i && !j)
     {
         Log("no hooks installed, idle");
         return 0;
@@ -2165,8 +2645,8 @@ static DWORD WINAPI MainThread(LPVOID hSelf)
     CloseHandle(CreateThread(nullptr, 0, FontFileThread, hSelf, 0, nullptr));
 
     CloseHandle(CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr));
-    Log("v7 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d, idling",
-        g_dictCount, files, (int)a, (int)b, (int)c, (int)d, (int)e);
+    Log("v7.5 active: dict=%u keys (%u files), hooks A=%d B=%d C=%d D=%d E=%d F=%d G=%d H=%d I=%d J=%d, idling",
+        g_dictCount, files, (int)a, (int)b, (int)c, (int)d, (int)e, (int)f, (int)g, (int)h, (int)i, (int)j);
     return 0;
 }
 
@@ -2181,7 +2661,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         if (g_log)
         {
 			Log("[Info] SR3R Font Extend By HaoJun0823 https://www.haojun0823.xyz | https://github.com/HaoJun0823/SR3R_I18N");
-            Log("[DllMain] ATTACH v6");
+			Log("[DllMain] ATTACH v7");
             CloseHandle(CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr));
         }
         break;
