@@ -308,7 +308,8 @@ static const DictNode* DictLookup(const wchar_t* s, size_t len)
 struct OrigNode
 {
     uint32_t      crc;      // 键（消息 ID/HASH_）CRC
-    uint32_t      len;      // 英文原文长度（不含 NUL）
+    uint32_t      keyLen;   // 键长度（不含 NUL, 碰撞校验）
+    uint32_t      valLen;   // 英文原文长度（不含 NUL）
     const wchar_t* key;     // 键（碰撞校验）
     const wchar_t* val;     // 英文原文
     OrigNode*     next;
@@ -331,10 +332,11 @@ static bool OrigInsert(const wchar_t* key, uint32_t keyLen, const wchar_t* val, 
     memcpy(valCopy, val, valLen * sizeof(wchar_t));
     valCopy[valLen] = L'\0';
 
-    node->crc  = CrcText(keyCopy, keyLen);
-    node->len  = valLen;
-    node->key  = keyCopy;
-    node->val  = valCopy;
+    node->crc    = CrcText(keyCopy, keyLen);
+    node->keyLen = keyLen;
+    node->valLen = valLen;
+    node->key    = keyCopy;
+    node->val    = valCopy;
     uint32_t h = node->crc & g_origMask;
     node->next = g_origBuckets[h];
     g_origBuckets[h] = node;
@@ -347,7 +349,7 @@ static const OrigNode* OrigLookup(const wchar_t* s, size_t len)
     if (!g_origBuckets) return nullptr;
     uint32_t crc = CrcText(s, len);
     for (OrigNode* n = g_origBuckets[crc & g_origMask]; n; n = n->next)
-        if (n->crc == crc && n->len == len && wmemcmp(n->key, s, len) == 0)
+        if (n->crc == crc && n->keyLen == len && wmemcmp(n->key, s, len) == 0)
             return n;
     return nullptr;
 }
@@ -1544,7 +1546,7 @@ static void AddDictEntry(const wchar_t* key, const wchar_t* val,
     if (g_origBuckets)
     {
         const OrigNode* o = OrigLookup(key, on);
-        if (o && o->len > 0) { effKey = o->val; effLen = o->len; }
+        if (o && o->valLen > 0) { effKey = o->val; effLen = o->valLen; }
         else if (!o && on > 5 && _wcsnicmp(key, L"HASH_", 5) == 0)
         { ++*hashKeys; return; }   // origin 里也查不到的 HASH_ 槽位名
     }

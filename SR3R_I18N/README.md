@@ -1,14 +1,3 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: 'a42e7a68-1954-4e15-850a-733f26af59bf'
-  PropagateID: 'a42e7a68-1954-4e15-850a-733f26af59bf'
-  ReservedCode1: '8c20e865-1f11-42f5-91aa-380f32157b6a'
-  ReservedCode2: '8c20e865-1f11-42f5-91aa-380f32157b6a'
----
-
 # SR3R_I18N — Saints Row The Third Remastered External Localization DLL
 
 外挂式运行时汉化 DLL：不动任何游戏资源文件，在内存中替换文本并注入中文字形渲染。
