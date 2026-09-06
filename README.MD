@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'f839a573-9370-45e7-b193-72514bbe3ea1'
-  PropagateID: 'f839a573-9370-45e7-b193-72514bbe3ea1'
-  ReservedCode1: '6dc7256b-e05f-48e5-93e1-3578e42aab24'
-  ReservedCode2: '6dc7256b-e05f-48e5-93e1-3578e42aab24'
+  ProduceID: '8eda91b5-8835-4f70-a1ea-e92d6b7085d9'
+  PropagateID: '8eda91b5-8835-4f70-a1ea-e92d6b7085d9'
+  ReservedCode1: 'c0eebb87-4ae0-4667-8ca3-73e8ed3e716a'
+  ReservedCode2: 'c0eebb87-4ae0-4667-8ca3-73e8ed3e716a'
 ---
 
 # SR3R 汉化工程总目录（SR3R_DLL）
@@ -46,12 +46,13 @@ SR3R_DLL\
 ├── SR3R_I18N\        外挂汉化 DLL 工程（VS2017 v141 x64 /MT，v7.5.2）
 │   ├── dllmain.cpp   全部实现（约 2800 行：hook A–J + 字形层 + 词典层）
 │   └── README.md     DLL 自身详细文档（架构/词典格式/配置/陷阱，中英双语）
-├── le_data\          简体中文本地化 git 仓库（完整克隆，54 个提交 + 未跟踪 voice_dumps）
+├── le_data\          简体中文本地化 **独立 git 仓库**（54 个提交 + 未跟踪 voice_dumps）
 │   ├── schinese\     内核层简体中文词典（misc_kernel 的文本源）
 │   ├── voice_dumps_chinese\  语音字幕中文化 dump（voice_001~010 词典的上游）
 │   ├── original\     英文原文基准
 │   ├── .qa\ 审计/校对产物（terms_cand.md、审计问题清单.xlsx、QA 汇总、校对发现）
 │   └── .temp\ .workbuddy\  中间产物（未跟踪）
+│   └── **注意：独立 git 仓库，需单独克隆/复制，不随主仓库分发**
 ├── Tools\            52 个 Python 工具（vpp 打包解包/纹理烘焙/构建/校验/崩溃分析）
 ├── Docs\             3 份核心逆向文档（见下）
 ├── Dict_CHS\         词典资产：voice_001~010.txt（9630 条语音字幕）+ charlist.txt + ini 样例
@@ -124,9 +125,9 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ## 五、翻译交接包（Handoff\）与 le_data 仓库现状
 
-### le_data 仓库（G:\Projects\SR3R_DLL\le_data）
+### le_data 仓库（独立 git 仓库：`G:\Projects\SR3R_DLL\le_data`）
 
-内核层简体中文翻译的**版本化仓库**（源位于游戏 `unpack\text\le_data`，本目录为完整克隆，54 个提交保留）。提交史即翻译工作流实录：接管翻译批次（static/diversion/activity…）→ 审计入库 → 批次 A–D 逐条修复（占位符/引号/术语漂移/空格对齐）→ 三校/四校 → 敏感词软化（HEAD `edfc5d0`）。定名表 v1.1、审计问题清单、QA 汇总都在仓库内 `.qa\` 与根目录。`voice_dumps\`（英文原始 dump，20 个文件）未被 git 跟踪，是手动补齐的。
+内核层简体中文翻译的**独立版本化仓库**（源位于游戏 `unpack\text\le_data`，54 个提交保留）。**注意：该目录自带 `.git`，主仓库通过 `.gitignore` 排除、以独立仓库方式分发——克隆主仓库后需单独克隆/复制 le_data 才能获取翻译词典与声音字幕资产**。提交史即翻译工作流实录：接管翻译批次（static/diversion/activity…）→ 审计入库 → 批次 A–D 逐条修复（占位符/引号/术语漂移/空格对齐）→ 三校/四校 → 敏感词软化（HEAD `edfc5d0`）。定名表 v1.1、审计问题清单、QA 汇总都在仓库内 `.qa\` 与根目录。`voice_dumps\`（英文原始 dump，20 个文件）未被 git 跟踪，是手动补齐的。
 
 ### Handoff 交接包
 
