@@ -3,18 +3,20 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '8eda91b5-8835-4f70-a1ea-e92d6b7085d9'
-  PropagateID: '8eda91b5-8835-4f70-a1ea-e92d6b7085d9'
-  ReservedCode1: 'c0eebb87-4ae0-4667-8ca3-73e8ed3e716a'
-  ReservedCode2: 'c0eebb87-4ae0-4667-8ca3-73e8ed3e716a'
+  ProduceID: '0fa718fe-d7e2-456a-b666-87139c50ae61'
+  PropagateID: '0fa718fe-d7e2-456a-b666-87139c50ae61'
+  ReservedCode1: 'feccc722-99fd-4749-a109-bf90f6a752f4'
+  ReservedCode2: 'feccc722-99fd-4749-a109-bf90f6a752f4'
 ---
 
 # SR3R 汉化工程总目录（SR3R_DLL）
 
-《黑道圣徒3：重制版》（Saints Row The Third Remastered，以下简称 SR3R）简体中文汉化工程的**自包含归档**：外挂汉化 DLL 源码工程、全部构建/逆向/翻译工具链、词典与字体资产、翻译交接包、以及完整的逆向结论与踩坑记录。
+《黑道圣徒3：重制版》（Saints Row The Third Remastered，SR3R）简体中文汉化工程的**自包含归档**：外挂汉化 DLL 源码工程、全部构建/逆向/翻译工具链、词典与字体资产、翻译交接包、以及完整的逆向结论与踩坑记录。
 
 游戏目录：`I:\SteamLibrary\steamapps\common\Saints Row The Third Remastered`
 工程目录（工作区，含大量未归档中间产物）：上述目录下的 `工程目录\`
+
+> **姊妹项目**：同作者的《黑道圣徒4：重制版》汉化见 **[SR4R_I18N](https://github.com/HaoJun0823/SR4R_I18N)**（本仓库的 SR4R 移植版，dinput8/binkw64 代理注入、词典+字形架构同源）。两个仓库共享同一套外挂注入/字形注入/词典替换方法论，互可对照阅读。
 
 ---
 
@@ -54,21 +56,22 @@ SR3R_DLL\
 │   └── .temp\ .workbuddy\  中间产物（未跟踪）
 │   └── **注意：独立 git 仓库，需单独克隆/复制，不随主仓库分发**
 ├── Tools\            52 个 Python 工具（vpp 打包解包/纹理烘焙/构建/校验/崩溃分析）
-├── Docs\             3 份核心逆向文档（见下）
+├── Docs\             4 份核心逆向文档（见下）
 ├── Dict_CHS\         词典资产：voice_001~010.txt（9630 条语音字幕）+ charlist.txt + ini 样例
 ├── Handoff\          翻译交接包：source.jsonl（5763 条）+ 术语表 + 回填脚本 + 已译分片
 ├── Fonts\            SourceHanSansHWSC-VF.ttf（思源黑体，运行时字体；le_data 内有同款副本）
-├── packages\         MinHook 1.3.3 静态库依赖
+├── packages\         MinHook 1.3.3 静态库依赖（许可证见 LICENSE-MinHook.txt）
 └── SR3R_DLL.slnx     解决方案
 ```
 
-### Docs\ 三份文档分工
+### Docs\ 四份文档分工
 
 | 文件 | 内容 | 状态 |
 |---|---|---|
 | `SRTT3_CN_HANDBOOK.md`（531 行） | 格式逆向手册：vpp_pc/le_strings/vf3/cvbm/gvbm/DXT5 全格式规格与解包打包方法 | 有效 |
 | `SRTT3_CN_ACHIEVEMENTS.md`（222 行） | 历史攻坚记录：内核文本替换路线全过程 | **部分结论已过时**（GPU 池推断被 CPU 池 64KB 根因取代，见上文） |
 | `3DM-hook重写技术规格.md`（399 行） | 3DM 汉化 DLL 完整逆向规格：hook 点、补丁表、trampoline 解码 | 参考用（本项目最终未采用 3DM 路线） |
+| `字幕换行英文残留问题解决全记录.md`（约 300 行） | v7.3→v7.5 语音字幕折行残留/时长控制码排障实录，Hook J 落点的由来 | 有效（历史决策依据） |
 
 ### 有用/无用判定（游戏目录内未归档部分）
 
@@ -83,7 +86,34 @@ SR3R_DLL\
 
 ---
 
-## 三、SR3R_I18N.asi 功能概览
+## 三、ASI Loader 注入机制（binkw64 代理）
+
+SR3R 与 SR4R 使用同一套**代理 DLL（proxy DLL）注入**方式，不修改游戏 EXE、不依赖第三方注入器：
+
+1. **原版改名**：游戏根目录的原版 `binkw64.dll` 重命名为 `binkw64Hooked.dll`。
+2. **代理加载器**：放一个同名的 `binkw64.dll`（本仓库的 ASI Loader，源自 dinput8/Ultimate ASI Loader 方案）顶替原版。游戏启动时加载的是这个代理 DLL。
+3. **转发 + 注入**：代理 DLL 在其 `DllMain` 里（a）`LoadLibrary("binkw64Hooked.dll")` 把原版函数转发过去，保证游戏对 binkw64 的调用正常；（b）扫描 `scripts\` 目录，把 `*.asi`（我们的 `SR3R_I18N.asi`）全部 `LoadLibrary` 加载进进程。
+4. **生效**：`SR3R_I18N.asi` 的 `DllMain` 里安装各 Hook（MinHook），此后文本替换与字形注入生效。卸载/删除代理 DLL 即完全恢复原版。
+
+```
+游戏根目录/
+├── binkw64.dll        (代理 loader，即 ASI Loader，勿删)
+├── binkw64Hooked.dll   (原版 binkw64，被代理转发)
+└── scripts/
+    ├── SR3R_I18N.asi   (本工程 DLL，被代理加载)
+    ├── SR3R_I18N.ini
+    ├── dict\voice_001~010.txt
+    ├── charlist.txt
+    └── SourceHanSansHWSC-VF.ttf
+```
+
+**为什么用 binkw64 而不是 dinput8**：SRTT Remastered（与 SR4R 一样）都是 x64 原生程序，使用常规的 dinput8 代理注入亦可，但游戏引擎加载路径中 `binkw64.dll` 是必加载的视频解码组件，作为代理宿主更隐蔽、更不易被反外挂误伤，且与 3DM/游侠时代的 .asi 生态兼容（.asi 文件本身就是 DLL，仅扩展名不同）。
+
+> 注意：上面根目录的 `binkw64.dll` 是**注入器**而非本工程产物；真正干活的是 `scripts\SR3R_I18N.asi`。打包发布时不要把代理 loader 与汉化 DLL 混为一谈。
+
+---
+
+## 四、SR3R_I18N.asi 功能概览
 
 v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
@@ -105,13 +135,13 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ---
 
-## 四、工具链（Tools\，52 个脚本）
+## 五、工具链（Tools\，52 个脚本）
 
 按用途分组（全部 2026-09 期间为 SR3R 工程编写，Python 3.x，无第三方依赖为主）：
 
 **vpp_pc 资源包**：`vpp_pack.py` / `vpp_extract_all.py` / `vpp_probe.py` / `vpp_scan_all.py` / `vpp_verify.py` / `vpp_selfcheck.py` / `vpp_list_fonts.py` / `diagnose_vpp.py` / `cmp_misc.py` / `extract_orig_misc.py` / `reextract_orig.py`
 
-**le_strings 文本**：`sr3le_extract.py` / `le_strings_repack.py` / `merge_translations.py` / `check_match.py` / `verify_deployed.py` / `build_handoff.py`
+**le_strings 文本**：`Tools\sr3le_extract.py` / `Tools\le_strings_repack.py` / `Tools\merge_translations.py` / `Tools\check_match.py` / `Tools\verify_deployed.py` / `Tools\build_handoff.py`
 
 **字体/纹理**：`volition_tex.py` / `bake_lib.py` / `font_roundtrip.py` / `font_shape_test.py` / `fonts_probe.py` / `scan_vpp_fonts.py` / `slot_table.py` / `check_deployed_vf3.py` / `restore_fonts.py` / 字体着色系列（`font_tint*.py` / `tint_*.py`）
 
@@ -123,7 +153,7 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ---
 
-## 五、翻译交接包（Handoff\）与 le_data 仓库现状
+## 六、翻译交接包（Handoff\）与 le_data 仓库现状
 
 ### le_data 仓库（独立 git 仓库：`G:\Projects\SR3R_DLL\le_data`）
 
@@ -144,7 +174,7 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ---
 
-## 六、历史路线演进（为什么是现在这个方案）
+## 七、历史路线演进（为什么是现在这个方案）
 
 1. **内核资源替换探索期**：解包 vpp_pc → 逆向 le_strings/vf3/cvbm/gvbm 全格式 → 改文本可行，改字库撞 64KB CPU 池崩溃（93 个 dump 排障，最终根因见上文）。`SRTT3_CN_ACHIEVEMENTS.md` 是这一时期的完整记录。
 2. **第三方方案逆向期**：3DM（.asi hook + text.btxt 词典）与游侠（资源 + 运行时扩池 DLL）两条路线全拆解。3DM hook 规格完整沉淀在 `3DM-hook重写技术规格.md`。结论：两者都依赖运行时补丁，纯资源方案不存在。
@@ -153,7 +183,7 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ---
 
-## 七、踩坑经验精选
+## 八、踩坑经验精选
 
 完整版见 `SR3R_I18N\README.md`「可靠性结论与陷阱」（13 条），此处列工程级教训：
 
@@ -168,7 +198,7 @@ v7.5.2，详见 `SR3R_I18N\README.md`（本节只列骨架）：
 
 ---
 
-## 八、如何重建 / 继续开发
+## 九、如何重建 / 继续开发
 
 **重新部署运行环境**（游戏 `scripts\` 目录）：
 ```
@@ -184,9 +214,11 @@ SR3R_I18N.asi + SR3R_I18N.ini + dict\voice_001~010.txt + charlist.txt + SourceHa
 
 ---
 
-## 九、版权与致谢
+## 十、版权与致谢
 
 - 本工程：GPL-3.0。作者 HaoJun0823。
+- MinHook（运行时 hook 库）：BSD-2-Clause，作者 Tsuda Kageyu，许可证全文见 `LICENSE-MinHook.txt`。
+- stb_truetype（字形光栅化）：Public Domain / MIT，随 `SR3R_I18N\stb_truetype.h` 分发。
 - 思源黑体（Source Han Sans HW SC）：SIL Open Font License 1.1，Adobe/Google。
 - 游侠（ali213）、3DM 汉化仅作逆向学习参考，未分发其文件。
 - 游戏本体资源版权归 Deep Silver/Volition 所有，本工程不分发游戏资源。
