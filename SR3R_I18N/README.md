@@ -1,15 +1,4 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '52da9bba-676e-4325-ade2-b075f7c1c255'
-  PropagateID: '52da9bba-676e-4325-ade2-b075f7c1c255'
-  ReservedCode1: '6775c2f0-baf8-47d7-82db-b62aaa540002'
-  ReservedCode2: '6775c2f0-baf8-47d7-82db-b62aaa540002'
----
-
-# SR3R_I18N — Saints Row The Third Remastered External Localization DLL
+﻿# SR3R_I18N — Saints Row The Third Remastered External Localization DLL
 
 外挂式运行时汉化 DLL：不动任何游戏资源文件，在内存中替换文本并注入中文字形渲染。
 External, runtime-only localization DLL: no game resource files are touched; text is swapped in memory and CJK glyph rendering is injected on the fly.

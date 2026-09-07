@@ -1,15 +1,4 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: 'c1fd931a-e7b5-4a85-bfbd-32a9f2ed0304'
-  PropagateID: 'c1fd931a-e7b5-4a85-bfbd-32a9f2ed0304'
-  ReservedCode1: 'dbf0508c-eef4-49e8-a9d5-fc35f0a23ff7'
-  ReservedCode2: 'dbf0508c-eef4-49e8-a9d5-fc35f0a23ff7'
----
-
-# 《黑道圣徒3：重制版》3DM 汉化补丁逆向技术规格
+﻿# 《黑道圣徒3：重制版》3DM 汉化补丁逆向技术规格
 
 > 基础：3dm64.dll (1,150,976 字节, x64, 基址 0x7000000000) 全量逆向
 > 目的：在新版 SRTTR.exe (2026/1/29 更新) 上重新实现等效 hook（ASI 插件路线）

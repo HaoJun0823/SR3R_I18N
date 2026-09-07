@@ -1,15 +1,4 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '13e8a568-34d5-4d6f-a039-7a9d7db40514'
-  PropagateID: '13e8a568-34d5-4d6f-a039-7a9d7db40514'
-  ReservedCode1: 'd081e385-c84d-4f69-8fa7-d1c88a2f94ca'
-  ReservedCode2: 'd081e385-c84d-4f69-8fa7-d1c88a2f94ca'
----
-
-# SRTT3 汉化术语定名表（v1，2026-09-04 定稿）
+﻿# SRTT3 汉化术语定名表（v1，2026-09-04 定稿）
 
 > 用法：翻译时遇到下列英文一律使用"定名"列译名。表外新专名自行定名后追加到 §9。
 > 原则：帮派/人名/地名求稳（不玩梗），活动/商店/武器名允许玩梗（贴合本作恶搞气质）。
