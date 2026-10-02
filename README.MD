@@ -1,4 +1,6 @@
-﻿# SR3R 汉化工程总目录（SR3R_DLL）
+# 该项目已经与4代工程合并：https://github.com/HaoJun0823/SR_GAME_CHINESE
+
+# SR3R 汉化工程总目录（SR3R_DLL）
 
 《黑道圣徒3：重制版》（Saints Row The Third Remastered，SR3R）简体中文汉化工程的**自包含归档**：外挂汉化 DLL 源码工程、全部构建/逆向/翻译工具链、词典与字体资产、翻译交接包、以及完整的逆向结论与踩坑记录。
 
